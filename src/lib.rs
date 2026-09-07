@@ -29,6 +29,8 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
     if config.dry_run {
         tracing::info!("DRY_RUN=true — upstream stubs and redis publish are mocked by default");
         spawn_mock_publisher(config.clone(), fanout.clone()).await;
+    } else {
+        upstreams.spawn_live(fanout.clone());
     }
 
     let upstreams_poll = upstreams.clone();

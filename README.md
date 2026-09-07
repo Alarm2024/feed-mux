@@ -47,7 +47,7 @@ Local fan-out feed multiplexer for **Bot 350** (primary consumer) and the **pyth
     ╳ KEEP / arb-bot / rust  —  MUST NOT connect or subscribe
 ```
 
-**MVP status:** upstream connectors are **stubs** behind feature flags. Default mode is **`DRY_RUN=true`** (mock publish, no live upstream or Redis writes).
+**MVP status:** upstream connectors run as **stubs when `DRY_RUN=true`** (mock publish, no live connections). With **`DRY_RUN=false`** and feature flags enabled, live upstreams connect using the configured endpoints. Triton gRPC and Titan WS are rate-limited **independently**.
 
 ---
 
@@ -127,11 +127,25 @@ Copy [`.env.example`](.env.example). Key settings:
 | `REDIS_CHANNEL` | `feed:350` | Pub/sub channel for Bot 350 consumers |
 | `MOCK_PUBLISH_INTERVAL_SECS` | `30` | Periodic mock tick in dry-run (`0` = off) |
 | `ENABLE_CHAINSTACK` | `false` | Chainstack RPC/WS stub |
-| `ENABLE_HELIUS` | `false` | Helius backup stub |
-| `ENABLE_TRITON_GRPC` | `false` | Triton gRPC stub |
+| `ENABLE_HELIUS` | `false` | Helius backup RPC (live when `DRY_RUN=false`) |
+| `HELIUS_RPC_URL` | — | Helius HTTPS RPC URL (include API key in URL). Required when `ENABLE_HELIUS=true` and `DRY_RUN=false`. |
+| `ENABLE_TRITON_GRPC` | `false` | Triton gRPC feed (live when `DRY_RUN=false`) |
+| `TRITON_GRPC_URL` | — | Triton gRPC endpoint. Required when `ENABLE_TRITON_GRPC=true` and `DRY_RUN=false`. |
 | `TRITON_RATE_LIMIT_RPS` | `50` | **Separate** Triton rate limit |
-| `ENABLE_TITAN_WS` | `false` | Titan WebSocket stub |
+| `ENABLE_TITAN_WS` | `false` | Titan WebSocket feed (live when `DRY_RUN=false`) |
+| `TITAN_WS_URL` | — | Titan Direct WebSocket URL (may include auth query param). Required when `ENABLE_TITAN_WS=true` and `DRY_RUN=false`. |
+| `TITAN_WALLET_PUBKEY` | — | Solana wallet public key (base58). **Required** for live Titan — quotes are subscribed and compiled for this account. Use the **Bot 350 `cheap_2` wallet pubkey only**; never a KEEP / Garden Angel wallet. |
 | `TITAN_RATE_LIMIT_RPS` | `30` | **Separate** Titan rate limit |
+
+### Upstream activation matrix
+
+| Upstream | Dry-run (`DRY_RUN=true`) | Live (`DRY_RUN=false`) |
+|----------|--------------------------|-------------------------|
+| Helius | Stub poll only | Requires `ENABLE_HELIUS=true` + `HELIUS_RPC_URL` |
+| Triton gRPC | Stub poll, rate-limited | Requires `ENABLE_TRITON_GRPC=true` + `TRITON_GRPC_URL`, rate-limited |
+| Titan WS | Stub poll, rate-limited | Requires `ENABLE_TITAN_WS=true` + `TITAN_WS_URL` + `TITAN_WALLET_PUBKEY`, rate-limited |
+
+If Titan is enabled live without `TITAN_WALLET_PUBKEY`, feed-mux **refuses to connect** and logs: *wallet pubkey required for quote subscribe/compile*.
 
 Upstream URL vars (`CHAINSTACK_*`, `HELIUS_*`, `TRITON_GRPC_URL`, `TITAN_WS_URL`) are only read when their feature flag is enabled.
 
