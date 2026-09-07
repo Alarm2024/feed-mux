@@ -41,7 +41,7 @@ impl UpstreamHub {
         ]
     }
 
-    /// Poll all enabled upstream stubs (no-op in dry-run).
+    /// Poll all enabled upstream stubs (no-op in dry-run for live upstreams).
     pub async fn poll_stubs(&self) {
         if self.chainstack.is_enabled() {
             self.chainstack.poll_stub().await;
@@ -55,5 +55,10 @@ impl UpstreamHub {
         if self.titan.is_enabled() {
             self.titan.poll_stub().await;
         }
+    }
+
+    /// Start live upstream background tasks (only when DRY_RUN=false and configured).
+    pub fn spawn_live(&self, fanout: crate::redis_fanout::RedisFanout) {
+        self.titan.spawn_live(fanout);
     }
 }

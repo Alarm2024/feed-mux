@@ -30,6 +30,7 @@ async fn redacted_summary_never_contains_redis_password() {
         triton_rate_limit_rps: 50,
         enable_titan_ws: false,
         titan_ws_url: None,
+        titan_wallet_pubkey: None,
         titan_rate_limit_rps: 30,
         mock_publish_interval_secs: 0,
     };
@@ -94,4 +95,60 @@ async fn health_and_mock_publish_smoke() {
         .unwrap();
     assert_eq!(publish["ok"], true);
     assert_eq!(publish["result"]["dry_run"], true);
+}
+
+#[test]
+fn titan_live_requires_wallet_pubkey() {
+    let config = Config {
+        bind_addr: "127.0.0.1:8787".to_string(),
+        dry_run: false,
+        redis_url: None,
+        redis_channel: "feed:350".to_string(),
+        enable_chainstack: false,
+        chainstack_rpc_url: None,
+        chainstack_ws_url: None,
+        enable_helius: false,
+        helius_rpc_url: None,
+        enable_triton_grpc: false,
+        triton_grpc_url: None,
+        triton_rate_limit_rps: 50,
+        enable_titan_ws: true,
+        titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
+        titan_wallet_pubkey: None,
+        titan_rate_limit_rps: 30,
+        mock_publish_interval_secs: 0,
+    };
+
+    let upstream = feed_mux::upstream::titan::TitanWsUpstream::new(&config);
+    let status = upstream.status();
+    assert_eq!(status.mode, "error/wallet-pubkey-required");
+    assert!(!status.connected);
+}
+
+#[test]
+fn titan_dry_run_stays_stub_without_wallet_pubkey() {
+    let config = Config {
+        bind_addr: "127.0.0.1:8787".to_string(),
+        dry_run: true,
+        redis_url: None,
+        redis_channel: "feed:350".to_string(),
+        enable_chainstack: false,
+        chainstack_rpc_url: None,
+        chainstack_ws_url: None,
+        enable_helius: false,
+        helius_rpc_url: None,
+        enable_triton_grpc: false,
+        triton_grpc_url: None,
+        triton_rate_limit_rps: 50,
+        enable_titan_ws: true,
+        titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
+        titan_wallet_pubkey: None,
+        titan_rate_limit_rps: 30,
+        mock_publish_interval_secs: 0,
+    };
+
+    let upstream = feed_mux::upstream::titan::TitanWsUpstream::new(&config);
+    let status = upstream.status();
+    assert_eq!(status.mode, "stub/dry-run");
+    assert!(!status.connected);
 }

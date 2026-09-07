@@ -27,6 +27,12 @@ nonzero_ext = "0.3"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.5", features = ["trace"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rmp-serde = "1"
+rmpv = "1"
+bs58 = "0.5"
+url = "2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
