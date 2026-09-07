@@ -11,9 +11,10 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::config::{parse_wallet_pubkey, Config};
 use crate::rate_limit::UpstreamRateLimiter;
 use crate::redis_fanout::{FeedPayload, RedisFanout};
+use crate::titan_local::TitanLocalRelay;
 use crate::upstream::UpstreamStatus;
 
-const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
+pub const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -184,7 +185,7 @@ impl TitanWsUpstream {
         );
     }
 
-    pub fn spawn_live(&self, fanout: RedisFanout) {
+    pub fn spawn_live(&self, fanout: RedisFanout, local_relay: Option<TitanLocalRelay>) {
         if self.live_state != TitanLiveState::Ready {
             return;
         }
@@ -200,7 +201,15 @@ impl TitanWsUpstream {
         let rate_limiter = self.rate_limiter.clone();
 
         tokio::spawn(async move {
-            run_live_loop(ws_url, wallet_pubkey, connected, rate_limiter, fanout).await;
+            run_live_loop(
+                ws_url,
+                wallet_pubkey,
+                connected,
+                rate_limiter,
+                fanout,
+                local_relay,
+            )
+            .await;
         });
     }
 }
@@ -211,10 +220,23 @@ async fn run_live_loop(
     connected: Arc<AtomicBool>,
     rate_limiter: UpstreamRateLimiter,
     fanout: RedisFanout,
+    local_relay: Option<TitanLocalRelay>,
 ) {
     loop {
         connected.store(false, Ordering::Relaxed);
-        match run_session(&ws_url, wallet_pubkey, &connected, &rate_limiter, &fanout).await {
+        if let Some(relay) = &local_relay {
+            relay.set_upstream_connected(false);
+        }
+        match run_session(
+            &ws_url,
+            wallet_pubkey,
+            &connected,
+            &rate_limiter,
+            &fanout,
+            local_relay.as_ref(),
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::warn!(upstream = "titan_ws", "Titan WebSocket session ended; reconnecting");
             }
@@ -236,6 +258,7 @@ async fn run_session(
     connected: &Arc<AtomicBool>,
     rate_limiter: &UpstreamRateLimiter,
     fanout: &RedisFanout,
+    local_relay: Option<&TitanLocalRelay>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut request = ws_url.into_client_request()?;
     request
@@ -245,6 +268,9 @@ async fn run_session(
     let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
     connected.store(true, Ordering::Relaxed);
+    if let Some(relay) = local_relay {
+        relay.set_upstream_connected(true);
+    }
     tracing::info!(upstream = "titan_ws", "Titan WebSocket connected");
 
     if !rate_limiter.try_acquire() {
@@ -287,7 +313,12 @@ async fn run_session(
 
     while let Some(msg) = read.next().await {
         match msg {
-            Ok(Message::Binary(data)) => handle_server_message(&data, fanout).await,
+            Ok(Message::Binary(data)) => {
+                if let Some(relay) = local_relay {
+                    relay.publish_frame(data.clone());
+                }
+                handle_server_message(&data, fanout).await;
+            }
             Ok(Message::Ping(payload)) => {
                 write.send(Message::Pong(payload)).await?;
             }
@@ -298,6 +329,9 @@ async fn run_session(
     }
 
     connected.store(false, Ordering::Relaxed);
+    if let Some(relay) = local_relay {
+        relay.set_upstream_connected(false);
+    }
     Ok(())
 }
 

@@ -58,7 +58,11 @@ impl UpstreamHub {
     }
 
     /// Start live upstream background tasks (only when DRY_RUN=false and configured).
-    pub fn spawn_live(&self, fanout: crate::redis_fanout::RedisFanout) {
-        self.titan.spawn_live(fanout);
+    pub fn spawn_live(
+        &self,
+        fanout: crate::redis_fanout::RedisFanout,
+        titan_local_relay: Option<crate::titan_local::TitanLocalRelay>,
+    ) {
+        self.titan.spawn_live(fanout, titan_local_relay);
     }
 }
