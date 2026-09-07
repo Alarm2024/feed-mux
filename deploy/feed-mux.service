@@ -1,0 +1,19 @@
+[Unit]
+Description=feed-mux — local fan-out feed for Bot 350
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=feedmux
+Group=feedmux
+WorkingDirectory=/opt/feed-mux
+EnvironmentFile=/opt/feed-mux/.env
+ExecStart=/opt/feed-mux/feed-mux
+Restart=on-failure
+RestartSec=5
+# Never log secrets — ensure .env is mode 600 and owned by feedmux
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

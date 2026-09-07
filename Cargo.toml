@@ -1,0 +1,33 @@
+[package]
+name = "feed-mux"
+version = "0.1.0"
+edition = "2021"
+description = "Local fan-out feed multiplexer for Bot 350 consumers"
+license = "MIT"
+readme = "README.md"
+
+[lib]
+name = "feed_mux"
+path = "src/lib.rs"
+
+[[bin]]
+name = "feed-mux"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+governor = "0.6"
+nonzero_ext = "0.3"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["full", "test-util"] }

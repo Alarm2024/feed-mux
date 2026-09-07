@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "changeme-local-only"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "changeme-local-only", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  feed-mux:
+    build: .
+    ports:
+      - "8787:8787"
+    environment:
+      BIND_ADDR: 0.0.0.0:8787
+      DRY_RUN: "true"
+      REDIS_URL: redis://:changeme-local-only@redis:6379/0
+      REDIS_CHANNEL: feed:350
+      MOCK_PUBLISH_INTERVAL_SECS: "15"
+      RUST_LOG: info,feed_mux=debug
+    depends_on:
+      redis:
+        condition: service_healthy
