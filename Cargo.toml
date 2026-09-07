@@ -27,6 +27,7 @@ nonzero_ext = "0.3"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.5", features = ["trace"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 rmp-serde = "1"
