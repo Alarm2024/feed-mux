@@ -1,11 +1,15 @@
-use feed_mux::{init_tracing, run, config::Config};
+use feed_mux::{config::Config, init_tracing, run};
+
+fn init_rustls_crypto_provider() {
+    // rustls 0.23 requires an explicit process-level CryptoProvider before any TLS.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+}
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls ring crypto provider");
-
+    init_rustls_crypto_provider();
     init_tracing();
     let config = Config::from_env();
     if let Err(e) = run(config).await {
