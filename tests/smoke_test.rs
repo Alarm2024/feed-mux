@@ -27,11 +27,12 @@ async fn redacted_summary_never_contains_redis_password() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
-        triton_rate_limit_rps: 50,
+        triton_rate_limit_rps: 25,
         enable_titan_ws: false,
         titan_ws_url: None,
         titan_wallet_pubkey: None,
-        titan_rate_limit_rps: 30,
+        titan_rate_limit_rps: 15,
+        titan_local_bind: "127.0.0.1:19001".to_string(),
         mock_publish_interval_secs: 0,
     };
     let summary = config.redacted_summary();
@@ -111,11 +112,12 @@ fn titan_live_requires_wallet_pubkey() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
-        triton_rate_limit_rps: 50,
+        triton_rate_limit_rps: 25,
         enable_titan_ws: true,
         titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
         titan_wallet_pubkey: None,
-        titan_rate_limit_rps: 30,
+        titan_rate_limit_rps: 15,
+        titan_local_bind: "127.0.0.1:19001".to_string(),
         mock_publish_interval_secs: 0,
     };
 
@@ -139,11 +141,12 @@ fn titan_dry_run_stays_stub_without_wallet_pubkey() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
-        triton_rate_limit_rps: 50,
+        triton_rate_limit_rps: 25,
         enable_titan_ws: true,
         titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
         titan_wallet_pubkey: None,
-        titan_rate_limit_rps: 30,
+        titan_rate_limit_rps: 15,
+        titan_local_bind: "127.0.0.1:19001".to_string(),
         mock_publish_interval_secs: 0,
     };
 

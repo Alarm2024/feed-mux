@@ -3,6 +3,7 @@ pub mod http;
 pub mod mock;
 pub mod rate_limit;
 pub mod redis_fanout;
+pub mod titan_local;
 pub mod upstream;
 
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use config::Config;
 use http::{router, AppState};
 use mock::spawn_mock_publisher;
 use redis_fanout::RedisFanout;
+use titan_local::TitanLocalRelay;
 use upstream::UpstreamHub;
 
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -26,11 +28,17 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
 
     let upstreams = Arc::new(UpstreamHub::from_config(&config));
 
+    let titan_local_relay = TitanLocalRelay::new();
+    titan_local_relay.clone().spawn_server(
+        config.titan_local_bind.clone(),
+        config.enable_titan_ws,
+    );
+
     if config.dry_run {
         tracing::info!("DRY_RUN=true — upstream stubs and redis publish are mocked by default");
         spawn_mock_publisher(config.clone(), fanout.clone()).await;
     } else {
-        upstreams.spawn_live(fanout.clone());
+        upstreams.spawn_live(fanout.clone(), Some(titan_local_relay));
     }
 
     let upstreams_poll = upstreams.clone();
