@@ -1,5 +1,9 @@
 use feed_mux::redis_fanout::{mux_keys, now_ms, RedisFanout, TitanMessageOutcome};
 use redis::AsyncCommands;
+use serial_test::serial;
+use std::sync::Once;
+
+static SKIP_NOTE: Once = Once::new();
 
 async fn redis_available(url: &str) -> bool {
     let Ok(client) = redis::Client::open(url) else {
@@ -23,10 +27,12 @@ fn test_redis_url() -> String {
 async fn require_redis() -> Option<(String, redis::aio::MultiplexedConnection)> {
     let url = test_redis_url();
     if !redis_available(&url).await {
-        eprintln!(
-            "skipping live mux metrics test — redis unavailable at REDIS_URL ({url}); \
-             start `docker compose up redis` or set REDIS_URL to run integration coverage"
-        );
+        SKIP_NOTE.call_once(|| {
+            eprintln!(
+                "note: optional mux Redis integration tests skipped (REDIS_URL unreachable); \
+                 cargo test still passes — run `docker compose up redis` to exercise live coverage"
+            );
+        });
         return None;
     }
     let client = redis::Client::open(url.as_str()).ok()?;
@@ -35,6 +41,7 @@ async fn require_redis() -> Option<(String, redis::aio::MultiplexedConnection)> 
 }
 
 #[tokio::test]
+#[serial]
 async fn boot_reset_zeroes_stale_counters_before_heartbeat() {
     let Some((url, mut conn)) = require_redis().await else {
         return;
@@ -70,6 +77,7 @@ async fn boot_reset_zeroes_stale_counters_before_heartbeat() {
 }
 
 #[tokio::test]
+#[serial]
 async fn connect_alone_does_not_set_pairs_live() {
     let Some((url, mut conn)) = require_redis().await else {
         return;
@@ -93,6 +101,7 @@ async fn connect_alone_does_not_set_pairs_live() {
 }
 
 #[tokio::test]
+#[serial]
 async fn quote_success_increments_decoded_not_served() {
     let Some((url, mut conn)) = require_redis().await else {
         return;
@@ -119,6 +128,7 @@ async fn quote_success_increments_decoded_not_served() {
 }
 
 #[tokio::test]
+#[serial]
 async fn live_mux_metrics_disconnect_clears_titan_up_and_pairs_live() {
     let Some((url, mut conn)) = require_redis().await else {
         return;
