@@ -38,6 +38,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
         tracing::info!("DRY_RUN=true — upstream stubs and redis publish are mocked by default");
         spawn_mock_publisher(config.clone(), fanout.clone()).await;
     } else {
+        fanout.reset_titan_state_at_boot().await;
         upstreams.spawn_live(fanout.clone(), Some(titan_local_relay));
 
         let heartbeat_fanout = fanout.clone();

@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+// Bot 350 mux Redis metrics (`mux:titan:*`, `mux:meta:heartbeat_ms`, `mux:meta:titan_up`).
+// Rust feed-mux owns these keys on FR; the legacy Python mux is dead — no dual-write.
+
 /// Redis keys read by Bot 350 eyes (legacy Python mux schema).
 pub mod mux_keys {
     pub const TITAN_FRAMES: &str = "mux:titan:frames";
@@ -123,6 +126,36 @@ impl RedisFanout {
         })
     }
 
+    /// Clear stale Titan mux counters left by the dead Python mux or a prior process.
+    /// Called once at boot before the heartbeat task starts so eyes never inherit ghost frames.
+    pub async fn reset_titan_state_at_boot(&self) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let zero = "0";
+        let results: Result<((), (), (), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
+            .set(mux_keys::TITAN_FRAMES, zero)
+            .set(mux_keys::TITAN_DECODED, zero)
+            .set(mux_keys::TITAN_ERRORS, zero)
+            .set(mux_keys::TITAN_SERVED, zero)
+            .set(mux_keys::TITAN_FELL_THROUGH, zero)
+            .set(mux_keys::TITAN_PAIRS_LIVE, zero)
+            .set(mux_keys::TITAN_LAST_FRAME_MS, zero)
+            .set(mux_keys::TITAN_FRESHEST_MS, zero)
+            .set(mux_keys::META_TITAN_UP, zero)
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, "failed to reset mux titan state at boot");
+        } else {
+            tracing::info!("mux titan counters reset at boot (rust feed-mux owns mux:titan:* keys)");
+        }
+    }
+
     /// Periodic liveness tick for Bot 350 eyes (`mux:meta:heartbeat_ms`).
     pub async fn heartbeat(&self) {
         if self.dry_run {
@@ -141,7 +174,8 @@ impl RedisFanout {
         }
     }
 
-    /// Reflect Titan WS upstream connectivity for eyes (`mux:meta:titan_up`, `mux:titan:pairs_live`).
+    /// Reflect Titan WS upstream connectivity (`mux:meta:titan_up` only).
+    /// `pairs_live` is set only after a real quote decode/publish — never on handshake.
     pub async fn set_titan_upstream_up(&self, up: bool) {
         if self.dry_run {
             return;
@@ -151,18 +185,19 @@ impl RedisFanout {
             return;
         };
         let flag = if up { "1" } else { "0" };
-        let pairs = if up { "1" } else { "0" };
         if let Err(e) = conn
             .set::<_, _, ()>(mux_keys::META_TITAN_UP, flag)
             .await
         {
             tracing::warn!(error = %e, up, "failed to write mux titan_up");
         }
-        if let Err(e) = conn
-            .set::<_, _, ()>(mux_keys::TITAN_PAIRS_LIVE, pairs)
-            .await
-        {
-            tracing::warn!(error = %e, up, "failed to write mux pairs_live");
+        if !up {
+            if let Err(e) = conn
+                .set::<_, _, ()>(mux_keys::TITAN_PAIRS_LIVE, "0")
+                .await
+            {
+                tracing::warn!(error = %e, "failed to clear mux pairs_live on disconnect");
+            }
         }
     }
 
@@ -196,12 +231,13 @@ impl RedisFanout {
             return;
         };
         let ts_str = ts.to_string();
+        // `served` is downstream-only in the legacy schema — never mirror decode count here.
         let results: Result<((), (), (), (), (), ()), redis::RedisError> = redis::pipe()
             .incr(mux_keys::TITAN_FRAMES, 1_i64)
             .incr(mux_keys::TITAN_DECODED, 1_i64)
-            .incr(mux_keys::TITAN_SERVED, 1_i64)
             .set(mux_keys::TITAN_LAST_FRAME_MS, &ts_str)
             .set(mux_keys::TITAN_FRESHEST_MS, &ts_str)
+            .set(mux_keys::TITAN_PAIRS_LIVE, "1")
             .set(mux_keys::META_TITAN_UP, "1")
             .query_async(conn)
             .await;
@@ -273,6 +309,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_metrics_are_no_ops() {
         let fanout = RedisFanout::connect(None, "feed:350".to_string(), true).await;
+        fanout.reset_titan_state_at_boot().await;
         fanout.heartbeat().await;
         fanout.set_titan_upstream_up(true).await;
         fanout.set_titan_upstream_up(false).await;
