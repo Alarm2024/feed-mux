@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{parse_wallet_pubkey, Config};
 use crate::rate_limit::UpstreamRateLimiter;
-use crate::redis_fanout::{FeedPayload, RedisFanout};
+use crate::redis_fanout::{FeedPayload, RedisFanout, TitanMessageOutcome};
 use crate::titan_local::TitanLocalRelay;
 use crate::upstream::UpstreamStatus;
 
@@ -224,6 +224,7 @@ async fn run_live_loop(
 ) {
     loop {
         connected.store(false, Ordering::Relaxed);
+        fanout.set_titan_upstream_up(false).await;
         if let Some(relay) = &local_relay {
             relay.set_upstream_connected(false);
         }
@@ -268,6 +269,7 @@ async fn run_session(
     let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
     connected.store(true, Ordering::Relaxed);
+    fanout.set_titan_upstream_up(true).await;
     if let Some(relay) = local_relay {
         relay.set_upstream_connected(true);
     }
@@ -329,6 +331,7 @@ async fn run_session(
     }
 
     connected.store(false, Ordering::Relaxed);
+    fanout.set_titan_upstream_up(false).await;
     if let Some(relay) = local_relay {
         relay.set_upstream_connected(false);
     }
@@ -340,6 +343,7 @@ async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(upstream = "titan_ws", error = %e, "failed to decode Titan message");
+            fanout.record_titan_decode_error().await;
             return;
         }
     };
@@ -354,10 +358,23 @@ async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
                 "note": "quote stream update (raw msgpack not forwarded)"
             })),
         };
-        if let Err(e) = fanout.publish(&payload).await {
-            tracing::warn!(upstream = "titan_ws", error = %e, "failed to fan-out Titan quote");
+        match fanout.publish(&payload).await {
+            Ok(_) => {
+                fanout
+                    .record_titan_message(TitanMessageOutcome::QuotePublished)
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(upstream = "titan_ws", error = %e, "failed to fan-out Titan quote");
+                fanout
+                    .record_titan_message(TitanMessageOutcome::RpcError)
+                    .await;
+            }
         }
     } else if message_contains_key(&value, "Error") {
+        fanout
+            .record_titan_message(TitanMessageOutcome::RpcError)
+            .await;
         tracing::warn!(
             upstream = "titan_ws",
             message = ?value,
@@ -365,6 +382,10 @@ async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
         );
     } else if message_contains_key(&value, "Response") {
         tracing::debug!(upstream = "titan_ws", "Titan WebSocket RPC response received");
+    } else {
+        fanout
+            .record_titan_message(TitanMessageOutcome::Unhandled)
+            .await;
     }
 }
 
