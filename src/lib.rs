@@ -39,6 +39,15 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
         spawn_mock_publisher(config.clone(), fanout.clone()).await;
     } else {
         upstreams.spawn_live(fanout.clone(), Some(titan_local_relay));
+
+        let heartbeat_fanout = fanout.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                heartbeat_fanout.heartbeat().await;
+            }
+        });
     }
 
     let upstreams_poll = upstreams.clone();

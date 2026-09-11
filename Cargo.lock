@@ -341,6 +341,7 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "rmpv",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
