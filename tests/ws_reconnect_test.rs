@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use feed_mux::ws_reconnect::{
-    classify_ws_error, close_ws_write, is_expected_disconnect, ReconnectBackoff, WsDisconnectKind,
+    classify_ws_error, close_ws_write, is_expected_disconnect, should_reset_backoff,
+    ReconnectBackoff, WsDisconnectKind,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::accept_async;
@@ -19,6 +20,43 @@ async fn reconnect_backoff_waits_and_grows() {
     backoff.wait().await;
     assert!(start.elapsed() >= Duration::from_millis(10));
     assert_eq!(backoff.next_delay(), Duration::from_millis(20));
+}
+
+#[tokio::test]
+async fn repeated_abrupt_close_grows_backoff_without_reset() {
+    let mut backoff = ReconnectBackoff::new(Duration::from_millis(10), Duration::from_millis(80));
+
+    for expected in [
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+        Duration::from_millis(40),
+        Duration::from_millis(80),
+    ] {
+        assert_eq!(
+            backoff.next_delay(),
+            expected,
+            "delay before unhealthy abrupt-close wait"
+        );
+        assert!(
+            !should_reset_backoff(false, Duration::from_millis(100)),
+            "short session without data must not reset backoff"
+        );
+        backoff.wait().await;
+    }
+
+    assert_eq!(backoff.next_delay(), Duration::from_millis(80), "stays capped");
+}
+
+#[tokio::test]
+async fn healthy_session_resets_backoff_after_growth() {
+    let mut backoff = ReconnectBackoff::new(Duration::from_millis(10), Duration::from_millis(80));
+    backoff.wait().await;
+    backoff.wait().await;
+    assert_eq!(backoff.next_delay(), Duration::from_millis(40));
+
+    assert!(should_reset_backoff(true, Duration::from_millis(1)));
+    backoff.reset();
+    assert_eq!(backoff.next_delay(), Duration::from_millis(10));
 }
 
 #[tokio::test]

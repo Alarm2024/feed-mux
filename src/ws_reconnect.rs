@@ -5,6 +5,9 @@ use tokio_tungstenite::tungstenite::error::{Error as WsError, ProtocolError};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::Level;
 
+/// Minimum time a session must stay up (without data) before backoff resets.
+pub const HEALTHY_SESSION_THRESHOLD: Duration = Duration::from_secs(5);
+
 /// Exponential backoff for WebSocket reconnect loops.
 #[derive(Debug, Clone)]
 pub struct ReconnectBackoff {
@@ -36,6 +39,11 @@ impl ReconnectBackoff {
         tokio::time::sleep(self.current).await;
         self.current = self.current.saturating_mul(2).min(self.max);
     }
+}
+
+/// Whether a completed session was healthy enough to reset reconnect backoff.
+pub fn should_reset_backoff(received_data: bool, connected_for: Duration) -> bool {
+    received_data || connected_for >= HEALTHY_SESSION_THRESHOLD
 }
 
 /// Why a WebSocket session ended — drives single-line reconnect logs.
@@ -187,26 +195,46 @@ pub fn log_ws_reconnect(
 mod tests {
     use super::*;
 
-    #[test]
-    fn backoff_doubles_until_cap() {
-        let mut b = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(8));
-        assert_eq!(b.next_delay(), Duration::from_secs(1));
-        b.current = b.current.saturating_mul(2).min(b.max);
-        assert_eq!(b.next_delay(), Duration::from_secs(2));
-        b.current = b.current.saturating_mul(2).min(b.max);
-        assert_eq!(b.next_delay(), Duration::from_secs(4));
-        b.current = b.current.saturating_mul(2).min(b.max);
-        assert_eq!(b.next_delay(), Duration::from_secs(8));
-        b.current = b.current.saturating_mul(2).min(b.max);
-        assert_eq!(b.next_delay(), Duration::from_secs(8));
+    #[tokio::test]
+    async fn backoff_doubles_until_cap_via_wait() {
+        let mut b = ReconnectBackoff::new(Duration::from_millis(1), Duration::from_millis(8));
+        assert_eq!(b.next_delay(), Duration::from_millis(1));
+        b.wait().await;
+        assert_eq!(b.next_delay(), Duration::from_millis(2));
+        b.wait().await;
+        assert_eq!(b.next_delay(), Duration::from_millis(4));
+        b.wait().await;
+        assert_eq!(b.next_delay(), Duration::from_millis(8));
+        b.wait().await;
+        assert_eq!(b.next_delay(), Duration::from_millis(8));
+    }
+
+    #[tokio::test]
+    async fn backoff_resets_after_success() {
+        let mut b = ReconnectBackoff::new(Duration::from_millis(2), Duration::from_millis(30));
+        b.wait().await;
+        b.wait().await;
+        assert_eq!(b.next_delay(), Duration::from_millis(8));
+        b.reset();
+        assert_eq!(b.next_delay(), Duration::from_millis(2));
     }
 
     #[test]
-    fn backoff_resets_after_success() {
-        let mut b = ReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(30));
-        b.current = Duration::from_secs(16);
-        b.reset();
-        assert_eq!(b.next_delay(), Duration::from_secs(2));
+    fn should_reset_when_data_received() {
+        assert!(should_reset_backoff(true, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn should_reset_when_connected_past_threshold() {
+        assert!(should_reset_backoff(
+            false,
+            HEALTHY_SESSION_THRESHOLD + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn should_not_reset_on_short_abrupt_session() {
+        assert!(!should_reset_backoff(false, Duration::from_secs(1)));
     }
 
     #[test]

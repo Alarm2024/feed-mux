@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -15,7 +15,8 @@ use crate::redis_fanout::{FeedPayload, RedisFanout, TitanMessageOutcome};
 use crate::titan_local::TitanLocalRelay;
 use crate::upstream::UpstreamStatus;
 use crate::ws_reconnect::{
-    classify_ws_error, close_ws_write, log_ws_reconnect, ReconnectBackoff, WsDisconnectKind,
+    classify_ws_error, close_ws_write, log_ws_reconnect, should_reset_backoff, ReconnectBackoff,
+    WsDisconnectKind,
 };
 
 pub const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
@@ -30,6 +31,12 @@ enum TitanLiveState {
     MissingWalletPubkey,
     InvalidWalletPubkey,
     Ready,
+}
+
+struct SessionOutcome {
+    kind: WsDisconnectKind,
+    received_data: bool,
+    connected_for: Duration,
 }
 
 pub struct TitanWsUpstream {
@@ -226,16 +233,11 @@ async fn run_live_loop(
     fanout: RedisFanout,
     local_relay: Option<TitanLocalRelay>,
 ) {
-    let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+    let mut backoff = ReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(30));
 
     loop {
-        connected.store(false, Ordering::Relaxed);
-        fanout.set_titan_upstream_up(false).await;
-        if let Some(relay) = &local_relay {
-            relay.set_upstream_connected(false);
-        }
+        mark_titan_disconnected(&connected, &fanout, local_relay.as_ref()).await;
 
-        let delay = backoff.next_delay();
         match run_session(
             &ws_url,
             wallet_pubkey,
@@ -246,22 +248,28 @@ async fn run_live_loop(
         )
         .await
         {
-            Ok(kind) => {
-                backoff.reset();
-                log_ws_reconnect("titan_ws", kind, delay, None);
+            Ok(outcome) => {
+                if should_reset_backoff(outcome.received_data, outcome.connected_for) {
+                    backoff.reset();
+                }
+                let delay = backoff.next_delay();
+                log_ws_reconnect("titan_ws", outcome.kind, delay, None);
+                mark_titan_disconnected(&connected, &fanout, local_relay.as_ref()).await;
+                backoff.wait().await;
             }
             Err(e) => {
+                mark_titan_disconnected(&connected, &fanout, local_relay.as_ref()).await;
                 let kind = classify_ws_error(&e);
                 let detail = if kind == WsDisconnectKind::TransportError {
                     Some(crate::ws_reconnect::ws_error_summary(&e))
                 } else {
                     None
                 };
+                let delay = backoff.next_delay();
                 log_ws_reconnect("titan_ws", kind, delay, detail.as_deref());
+                backoff.wait().await;
             }
         }
-
-        backoff.wait().await;
     }
 }
 
@@ -272,7 +280,10 @@ async fn run_session(
     rate_limiter: &UpstreamRateLimiter,
     fanout: &RedisFanout,
     local_relay: Option<&TitanLocalRelay>,
-) -> Result<WsDisconnectKind, WsError> {
+) -> Result<SessionOutcome, WsError> {
+    let session_start = Instant::now();
+    let mut received_data = false;
+
     let mut request = ws_url
         .into_client_request()
         .map_err(|e| WsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
@@ -336,6 +347,7 @@ async fn run_session(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
+                received_data = true;
                 if let Some(relay) = local_relay {
                     relay.publish_frame(data.clone());
                 }
@@ -343,11 +355,12 @@ async fn run_session(
             }
             Ok(Message::Ping(payload)) => {
                 if let Err(e) = write.send(Message::Pong(payload)).await {
-                    if crate::ws_reconnect::is_expected_disconnect(&e) {
-                        disconnect_kind = classify_ws_error(&e);
-                        break;
+                    disconnect_kind = classify_ws_error(&e);
+                    if disconnect_kind == WsDisconnectKind::TransportError {
+                        mark_titan_disconnected(connected, fanout, local_relay).await;
+                        return Err(e);
                     }
-                    return Err(e);
+                    break;
                 }
             }
             Ok(Message::Close(_)) => {
@@ -358,6 +371,7 @@ async fn run_session(
             Err(e) => {
                 disconnect_kind = classify_ws_error(&e);
                 if disconnect_kind == WsDisconnectKind::TransportError {
+                    mark_titan_disconnected(connected, fanout, local_relay).await;
                     return Err(e);
                 }
                 break;
@@ -367,7 +381,11 @@ async fn run_session(
 
     close_ws_write(&mut write).await;
     mark_titan_disconnected(connected, fanout, local_relay).await;
-    Ok(disconnect_kind)
+    Ok(SessionOutcome {
+        kind: disconnect_kind,
+        received_data,
+        connected_for: session_start.elapsed(),
+    })
 }
 
 fn session_encode_error(err: rmp_serde::encode::Error) -> WsError {
