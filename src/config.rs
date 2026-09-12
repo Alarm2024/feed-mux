@@ -31,7 +31,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            bind_addr: env_or("BIND_ADDR", "0.0.0.0:8787"),
+            bind_addr: env_or("BIND_ADDR", "127.0.0.1:8787"),
             dry_run: env_bool("DRY_RUN", true),
             redis_url: env::var("REDIS_URL").ok().filter(|s| !s.is_empty()),
             redis_channel: env_or("REDIS_CHANNEL", "feed:350"),

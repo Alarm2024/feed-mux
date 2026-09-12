@@ -121,8 +121,10 @@ Copy [`.env.example`](.env.example). Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIND_ADDR` | `0.0.0.0:8787` | HTTP listen address |
+| `BIND_ADDR` | `127.0.0.1:8787` | HTTP listen address (loopback by default) |
 | `DRY_RUN` | `true` | Mock upstreams + skip Redis writes |
+
+**Listen surface:** On ocean-drop (and by default everywhere), admin/metrics HTTP (`/health`, `/publish`) binds to **localhost only**. Set `BIND_ADDR=0.0.0.0:8787` only when you intentionally expose the port publicly — always place auth or a reverse proxy in front. Docker Compose publishes `127.0.0.1:8787` on the host; the container still uses `0.0.0.0:8787` internally so bridge port mapping works.
 | `REDIS_URL` | — | Redis URL with AUTH, e.g. `redis://:password@host:6379/0` |
 | `REDIS_CHANNEL` | `feed:350` | Pub/sub channel for Bot 350 consumers |
 | `MOCK_PUBLISH_INTERVAL_SECS` | `30` | Periodic mock tick in dry-run (`0` = off) |
