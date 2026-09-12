@@ -14,6 +14,16 @@ async fn config_defaults_to_dry_run() {
 }
 
 #[tokio::test]
+async fn config_defaults_bind_addr_to_loopback() {
+    std::env::remove_var("BIND_ADDR");
+    let config = Config::from_env();
+    assert_eq!(
+        config.bind_addr, "127.0.0.1:8787",
+        "BIND_ADDR should default to loopback"
+    );
+}
+
+#[tokio::test]
 async fn redacted_summary_never_contains_redis_password() {
     let config = Config {
         bind_addr: "127.0.0.1:8787".to_string(),
