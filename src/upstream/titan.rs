@@ -6,6 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{parse_wallet_pubkey, Config};
@@ -13,6 +14,9 @@ use crate::rate_limit::UpstreamRateLimiter;
 use crate::redis_fanout::{FeedPayload, RedisFanout, TitanMessageOutcome};
 use crate::titan_local::TitanLocalRelay;
 use crate::upstream::UpstreamStatus;
+use crate::ws_reconnect::{
+    classify_ws_error, close_ws_write, log_ws_reconnect, ReconnectBackoff, WsDisconnectKind,
+};
 
 pub const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -222,12 +226,16 @@ async fn run_live_loop(
     fanout: RedisFanout,
     local_relay: Option<TitanLocalRelay>,
 ) {
+    let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(30));
+
     loop {
         connected.store(false, Ordering::Relaxed);
         fanout.set_titan_upstream_up(false).await;
         if let Some(relay) = &local_relay {
             relay.set_upstream_connected(false);
         }
+
+        let delay = backoff.next_delay();
         match run_session(
             &ws_url,
             wallet_pubkey,
@@ -238,18 +246,22 @@ async fn run_live_loop(
         )
         .await
         {
-            Ok(()) => {
-                tracing::warn!(upstream = "titan_ws", "Titan WebSocket session ended; reconnecting");
+            Ok(kind) => {
+                backoff.reset();
+                log_ws_reconnect("titan_ws", kind, delay, None);
             }
             Err(e) => {
-                tracing::warn!(
-                    upstream = "titan_ws",
-                    error = %e,
-                    "Titan WebSocket session failed; reconnecting in 5s"
-                );
+                let kind = classify_ws_error(&e);
+                let detail = if kind == WsDisconnectKind::TransportError {
+                    Some(crate::ws_reconnect::ws_error_summary(&e))
+                } else {
+                    None
+                };
+                log_ws_reconnect("titan_ws", kind, delay, detail.as_deref());
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        backoff.wait().await;
     }
 }
 
@@ -260,11 +272,15 @@ async fn run_session(
     rate_limiter: &UpstreamRateLimiter,
     fanout: &RedisFanout,
     local_relay: Option<&TitanLocalRelay>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = ws_url.into_client_request()?;
+) -> Result<WsDisconnectKind, WsError> {
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|e| WsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
     request
         .headers_mut()
-        .insert("Sec-WebSocket-Protocol", TITAN_WS_PROTOCOL.parse()?);
+        .insert("Sec-WebSocket-Protocol", TITAN_WS_PROTOCOL.parse().map_err(|e| {
+            WsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?);
 
     let (ws_stream, _) = connect_async(request).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -278,7 +294,8 @@ async fn run_session(
     if !rate_limiter.try_acquire() {
         tracing::debug!(upstream = "titan_ws", "rate limit exceeded for GetInfo");
     } else {
-        let get_info = encode_client_request(1, ClientRequestData::GetInfo(GetInfoRequest {}))?;
+        let get_info = encode_client_request(1, ClientRequestData::GetInfo(GetInfoRequest {}))
+            .map_err(session_encode_error)?;
         write.send(Message::Binary(get_info)).await?;
     }
 
@@ -288,8 +305,8 @@ async fn run_session(
             "rate limit exceeded for NewSwapQuoteStream"
         );
     } else {
-        let input_mint = parse_wallet_pubkey(SOL_MINT)?;
-        let output_mint = parse_wallet_pubkey(USDC_MINT)?;
+        let input_mint = parse_wallet_pubkey(SOL_MINT).expect("SOL mint constant");
+        let output_mint = parse_wallet_pubkey(USDC_MINT).expect("USDC mint constant");
         let subscribe = encode_client_request(
             2,
             ClientRequestData::NewSwapQuoteStream(NewSwapQuoteStreamRequest {
@@ -303,7 +320,8 @@ async fn run_session(
                     user_public_key: wallet_pubkey,
                 },
             }),
-        )?;
+        )
+        .map_err(session_encode_error)?;
         write
             .send(Message::Binary(subscribe))
             .await?;
@@ -312,6 +330,8 @@ async fn run_session(
             "Titan NewSwapQuoteStream subscribed with configured wallet pubkey"
         );
     }
+
+    let mut disconnect_kind = WsDisconnectKind::AbruptClose;
 
     while let Some(msg) = read.next().await {
         match msg {
@@ -322,20 +342,51 @@ async fn run_session(
                 handle_server_message(&data, fanout).await;
             }
             Ok(Message::Ping(payload)) => {
-                write.send(Message::Pong(payload)).await?;
+                if let Err(e) = write.send(Message::Pong(payload)).await {
+                    if crate::ws_reconnect::is_expected_disconnect(&e) {
+                        disconnect_kind = classify_ws_error(&e);
+                        break;
+                    }
+                    return Err(e);
+                }
             }
-            Ok(Message::Close(_)) => break,
+            Ok(Message::Close(_)) => {
+                disconnect_kind = WsDisconnectKind::CleanClose;
+                break;
+            }
             Ok(_) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                disconnect_kind = classify_ws_error(&e);
+                if disconnect_kind == WsDisconnectKind::TransportError {
+                    return Err(e);
+                }
+                break;
+            }
         }
     }
 
+    close_ws_write(&mut write).await;
+    mark_titan_disconnected(connected, fanout, local_relay).await;
+    Ok(disconnect_kind)
+}
+
+fn session_encode_error(err: rmp_serde::encode::Error) -> WsError {
+    WsError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        err.to_string(),
+    ))
+}
+
+async fn mark_titan_disconnected(
+    connected: &Arc<AtomicBool>,
+    fanout: &RedisFanout,
+    local_relay: Option<&TitanLocalRelay>,
+) {
     connected.store(false, Ordering::Relaxed);
     fanout.set_titan_upstream_up(false).await;
     if let Some(relay) = local_relay {
         relay.set_upstream_connected(false);
     }
-    Ok(())
 }
 
 async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {

@@ -5,6 +5,7 @@ pub mod rate_limit;
 pub mod redis_fanout;
 pub mod titan_local;
 pub mod upstream;
+pub mod ws_reconnect;
 
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
