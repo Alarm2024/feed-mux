@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::upstream::titan::TITAN_WS_PROTOCOL;
+use crate::ws_reconnect::{close_ws_write, is_expected_disconnect};
 
 const BROADCAST_CAPACITY: usize = 256;
 
@@ -87,8 +88,18 @@ impl TitanLocalRelay {
 
                 let relay = self.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_client(stream, relay).await {
-                        tracing::debug!(peer = %peer, error = %e, "Titan local client session ended");
+                    match serve_client(stream, relay).await {
+                        Ok(()) => {}
+                        Err(e) if is_expected_disconnect(&e) => {
+                            tracing::debug!(peer = %peer, "Titan local client disconnected");
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                error = %crate::ws_reconnect::ws_error_summary(&e),
+                                "Titan local client session error"
+                            );
+                        }
                     }
                 });
             }
@@ -99,7 +110,7 @@ impl TitanLocalRelay {
 async fn serve_client(
     stream: tokio::net::TcpStream,
     relay: TitanLocalRelay,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), tokio_tungstenite::tungstenite::Error> {
     let ws = accept_hdr_async(stream, |req: &Request, mut resp: Response| {
         if !req
             .headers()
@@ -136,7 +147,12 @@ async fn serve_client(
             event = events.recv() => {
                 match event {
                     Ok(TitanLocalEvent::UpstreamFrame(data)) => {
-                        write.send(Message::Binary(data.into())).await?;
+                        if let Err(e) = write.send(Message::Binary(data.into())).await {
+                            if is_expected_disconnect(&e) {
+                                break;
+                            }
+                            return Err(e);
+                        }
                     }
                     Ok(TitanLocalEvent::UpstreamConnected(connected)) => {
                         let status = serde_json::json!({
@@ -144,7 +160,12 @@ async fn serve_client(
                             "upstream": "titan_ws",
                             "connected": connected,
                         });
-                        write.send(Message::Text(status.to_string().into())).await?;
+                        if let Err(e) = write.send(Message::Text(status.to_string().into())).await {
+                            if is_expected_disconnect(&e) {
+                                break;
+                            }
+                            return Err(e);
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::debug!(
@@ -158,16 +179,23 @@ async fn serve_client(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Ping(payload))) => {
-                        write.send(Message::Pong(payload)).await?;
+                        if let Err(e) = write.send(Message::Pong(payload)).await {
+                            if is_expected_disconnect(&e) {
+                                break;
+                            }
+                            return Err(e);
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => return Err(e.into()),
+                    Some(Err(e)) if is_expected_disconnect(&e) => break,
+                    Some(Err(e)) => return Err(e),
                 }
             }
         }
     }
 
+    close_ws_write(&mut write).await;
     Ok(())
 }
 
