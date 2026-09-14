@@ -43,6 +43,8 @@ async fn redacted_summary_never_contains_redis_password() {
         titan_wallet_pubkey: None,
         titan_rate_limit_rps: 15,
         titan_local_bind: "127.0.0.1:19001".to_string(),
+        titan_hunt_size_lamports: None,
+        titan_hop1_ttl_secs: 2,
         mock_publish_interval_secs: 0,
     };
     let summary = config.redacted_summary();
@@ -128,6 +130,8 @@ fn titan_live_requires_wallet_pubkey() {
         titan_wallet_pubkey: None,
         titan_rate_limit_rps: 15,
         titan_local_bind: "127.0.0.1:19001".to_string(),
+        titan_hunt_size_lamports: None,
+        titan_hop1_ttl_secs: 2,
         mock_publish_interval_secs: 0,
     };
 
@@ -157,6 +161,8 @@ fn titan_dry_run_stays_stub_without_wallet_pubkey() {
         titan_wallet_pubkey: None,
         titan_rate_limit_rps: 15,
         titan_local_bind: "127.0.0.1:19001".to_string(),
+        titan_hunt_size_lamports: None,
+        titan_hop1_ttl_secs: 2,
         mock_publish_interval_secs: 0,
     };
 

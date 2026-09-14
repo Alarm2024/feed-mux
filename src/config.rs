@@ -24,6 +24,10 @@ pub struct Config {
     pub titan_rate_limit_rps: u32,
     /// Local Titan WS relay for Bot 350 MUX_TITAN_BIND eyes probe
     pub titan_local_bind: String,
+    /// Comma-separated SOL hunt sizes in lamports (default ladder when unset)
+    pub titan_hunt_size_lamports: Option<String>,
+    /// TTL for hop-1 quote rows written to Redis (seconds)
+    pub titan_hop1_ttl_secs: u64,
     /// Mock publish interval in dry-run mode (seconds, 0 = disabled)
     pub mock_publish_interval_secs: u64,
 }
@@ -48,6 +52,8 @@ impl Config {
             titan_wallet_pubkey: env_optional("TITAN_WALLET_PUBKEY"),
             titan_rate_limit_rps: env_u32("TITAN_RATE_LIMIT_RPS", 15),
             titan_local_bind: env_or("TITAN_LOCAL_BIND", "127.0.0.1:19001"),
+            titan_hunt_size_lamports: env_optional("TITAN_HUNT_SIZE_LAMPORTS"),
+            titan_hop1_ttl_secs: env_u64("TITAN_HOP1_TTL_SECS", 2),
             mock_publish_interval_secs: env_u64("MOCK_PUBLISH_INTERVAL_SECS", 30),
         }
     }

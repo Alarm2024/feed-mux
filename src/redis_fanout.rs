@@ -8,18 +8,26 @@ use tokio::sync::Mutex;
 // Bot 350 mux Redis metrics (`mux:titan:*`, `mux:meta:heartbeat_ms`, `mux:meta:titan_up`).
 // Rust feed-mux owns these keys on FR; the legacy Python mux is dead — no dual-write.
 
-/// Redis keys read by Bot 350 eyes (legacy Python mux schema).
+/// Redis keys read by Bot 350 eyes (legacy Python mux schema + hunt delivery).
 pub mod mux_keys {
     pub const TITAN_FRAMES: &str = "mux:titan:frames";
     pub const TITAN_DECODED: &str = "mux:titan:decoded";
     pub const TITAN_ERRORS: &str = "mux:titan:errors";
+    /// Downstream mux proxy sessions only — never incremented on hop-1 decode/publish.
     pub const TITAN_SERVED: &str = "mux:titan:served";
+    pub const TITAN_HOP1_SERVED: &str = "mux:titan:hop1_served";
+    pub const TITAN_SIZE_BOARD: &str = "mux:titan:size_board";
     pub const TITAN_FELL_THROUGH: &str = "mux:titan:fell_through";
     pub const TITAN_PAIRS_LIVE: &str = "mux:titan:pairs_live";
     pub const TITAN_LAST_FRAME_MS: &str = "mux:titan:last_frame_ms";
     pub const TITAN_FRESHEST_MS: &str = "mux:titan:freshest_ms";
     pub const META_HEARTBEAT_MS: &str = "mux:meta:heartbeat_ms";
     pub const META_TITAN_UP: &str = "mux:meta:titan_up";
+
+    /// Per-size hop-1 quote row: `mux:titan:hop1:<BASE>-<MID>:<size_lamports>`
+    pub fn hop1_row_key(pair: &str, size_lamports: u64) -> String {
+        format!("mux:titan:hop1:{pair}:{size_lamports}")
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,18 +145,22 @@ impl RedisFanout {
             return;
         };
         let zero = "0";
-        let results: Result<((), (), (), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
-            .set(mux_keys::TITAN_FRAMES, zero)
-            .set(mux_keys::TITAN_DECODED, zero)
-            .set(mux_keys::TITAN_ERRORS, zero)
-            .set(mux_keys::TITAN_SERVED, zero)
-            .set(mux_keys::TITAN_FELL_THROUGH, zero)
-            .set(mux_keys::TITAN_PAIRS_LIVE, zero)
-            .set(mux_keys::TITAN_LAST_FRAME_MS, zero)
-            .set(mux_keys::TITAN_FRESHEST_MS, zero)
-            .set(mux_keys::META_TITAN_UP, zero)
-            .query_async(conn)
-            .await;
+        let empty_board = r#"{"schema":"mux.titan.size_board.v1","pins":[]}"#;
+        let results: Result<((), (), (), (), (), (), (), (), (), (), ()), redis::RedisError> =
+            redis::pipe()
+                .set(mux_keys::TITAN_FRAMES, zero)
+                .set(mux_keys::TITAN_DECODED, zero)
+                .set(mux_keys::TITAN_ERRORS, zero)
+                .set(mux_keys::TITAN_SERVED, zero)
+                .set(mux_keys::TITAN_HOP1_SERVED, zero)
+                .set(mux_keys::TITAN_SIZE_BOARD, empty_board)
+                .set(mux_keys::TITAN_FELL_THROUGH, zero)
+                .set(mux_keys::TITAN_PAIRS_LIVE, zero)
+                .set(mux_keys::TITAN_LAST_FRAME_MS, zero)
+                .set(mux_keys::TITAN_FRESHEST_MS, zero)
+                .set(mux_keys::META_TITAN_UP, zero)
+                .query_async(conn)
+                .await;
         if let Err(e) = results {
             tracing::warn!(error = %e, "failed to reset mux titan state at boot");
         } else {
@@ -258,6 +270,79 @@ impl RedisFanout {
             tracing::warn!(error = %e, key, "failed to incr mux counter");
         }
     }
+
+    /// Write a hop-1 quote row for Bot 350 hunt consumption.
+    pub async fn publish_titan_hop1(
+        &self,
+        row: &impl Serialize,
+        pair: &str,
+        size_lamports: u64,
+        ttl_secs: u64,
+    ) {
+        if self.dry_run {
+            tracing::info!(
+                pair = %pair,
+                size_lamports,
+                "dry-run hop-1 quote (redis skipped)"
+            );
+            return;
+        }
+
+        let json = match serde_json::to_string(row) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize hop-1 row");
+                return;
+            }
+        };
+
+        let key = mux_keys::hop1_row_key(pair, size_lamports);
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+
+        let ttl = ttl_secs.max(1);
+        let results: Result<((), ()), redis::RedisError> = redis::pipe()
+            .set_ex(&key, &json, ttl)
+            .incr(mux_keys::TITAN_HOP1_SERVED, 1_i64)
+            .query_async(conn)
+            .await;
+
+        if let Err(e) = results {
+            tracing::warn!(error = %e, key = %key, "failed to publish hop-1 row");
+        } else {
+            tracing::debug!(key = %key, ttl_secs = ttl, "published Titan hop-1 row");
+        }
+    }
+
+    /// Write aggregate per-size hop ages for Bot 350 /titan pin board.
+    pub async fn publish_titan_size_board(&self, board: &impl Serialize) {
+        if self.dry_run {
+            tracing::info!("dry-run size_board (redis skipped)");
+            return;
+        }
+
+        let json = match serde_json::to_string(board) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize size_board");
+                return;
+            }
+        };
+
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+
+        if let Err(e) = conn
+            .set::<_, _, ()>(mux_keys::TITAN_SIZE_BOARD, &json)
+            .await
+        {
+            tracing::warn!(error = %e, "failed to publish size_board");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,6 +373,8 @@ mod tests {
             mux_keys::TITAN_DECODED,
             mux_keys::TITAN_ERRORS,
             mux_keys::TITAN_SERVED,
+            mux_keys::TITAN_HOP1_SERVED,
+            mux_keys::TITAN_SIZE_BOARD,
             mux_keys::TITAN_FELL_THROUGH,
             mux_keys::TITAN_PAIRS_LIVE,
             mux_keys::TITAN_LAST_FRAME_MS,
@@ -295,7 +382,11 @@ mod tests {
             mux_keys::META_HEARTBEAT_MS,
             mux_keys::META_TITAN_UP,
         ];
-        assert_eq!(keys.len(), 10);
+        assert_eq!(keys.len(), 12);
+        assert_eq!(
+            mux_keys::hop1_row_key("SOL-USDC", 1_000_000_000),
+            "mux:titan:hop1:SOL-USDC:1000000000"
+        );
         for key in keys {
             assert!(key.starts_with("mux:"));
         }

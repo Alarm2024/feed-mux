@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -11,8 +11,12 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{parse_wallet_pubkey, Config};
 use crate::rate_limit::UpstreamRateLimiter;
-use crate::redis_fanout::{FeedPayload, RedisFanout, TitanMessageOutcome};
+use crate::redis_fanout::RedisFanout;
 use crate::titan_local::TitanLocalRelay;
+use crate::titan_quote::{
+    handle_titan_server_message, parse_hunt_sizes, TitanMessageKind, TitanSizeBoard,
+    TitanStreamRegistry, USDC_MINT, SOL_MINT,
+};
 use crate::upstream::UpstreamStatus;
 use crate::ws_reconnect::{
     classify_ws_error, close_ws_write, log_ws_reconnect, should_reset_backoff, ReconnectBackoff,
@@ -20,8 +24,6 @@ use crate::ws_reconnect::{
 };
 
 pub const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
-const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TitanLiveState {
@@ -39,6 +41,13 @@ struct SessionOutcome {
     connected_for: Duration,
 }
 
+struct TitanSessionContext {
+    stream_registry: Arc<Mutex<TitanStreamRegistry>>,
+    size_board: Arc<Mutex<TitanSizeBoard>>,
+    hop1_ttl_secs: u64,
+    hunt_sizes: Vec<u64>,
+}
+
 pub struct TitanWsUpstream {
     enabled: bool,
     dry_run: bool,
@@ -49,6 +58,8 @@ pub struct TitanWsUpstream {
     rate_limit_rps: u32,
     rate_limiter: UpstreamRateLimiter,
     connected: Arc<AtomicBool>,
+    hunt_sizes: Vec<u64>,
+    hop1_ttl_secs: u64,
 }
 
 impl TitanWsUpstream {
@@ -58,6 +69,7 @@ impl TitanWsUpstream {
             .titan_wallet_pubkey
             .as_deref()
             .and_then(|value| parse_wallet_pubkey(value).ok());
+        let hunt_sizes = parse_hunt_sizes(config.titan_hunt_size_lamports.as_deref());
 
         if config.enable_titan_ws && !config.dry_run {
             match live_state {
@@ -85,6 +97,8 @@ impl TitanWsUpstream {
                     tracing::info!(
                         upstream = "titan_ws",
                         rate_limit_rps = config.titan_rate_limit_rps,
+                        hunt_sizes = hunt_sizes.len(),
+                        hop1_ttl_secs = config.titan_hop1_ttl_secs,
                         "Titan WebSocket live mode configured (Bot 350 wallet pubkey only — never KEEP)"
                     );
                 }
@@ -102,6 +116,8 @@ impl TitanWsUpstream {
             rate_limit_rps: config.titan_rate_limit_rps,
             rate_limiter: UpstreamRateLimiter::new("titan_ws", config.titan_rate_limit_rps),
             connected: Arc::new(AtomicBool::new(false)),
+            hunt_sizes,
+            hop1_ttl_secs: config.titan_hop1_ttl_secs,
         }
     }
 
@@ -210,6 +226,12 @@ impl TitanWsUpstream {
             .expect("ready state implies wallet pubkey bytes");
         let connected = Arc::clone(&self.connected);
         let rate_limiter = self.rate_limiter.clone();
+        let session_ctx = TitanSessionContext {
+            stream_registry: Arc::new(Mutex::new(TitanStreamRegistry::default())),
+            size_board: Arc::new(Mutex::new(TitanSizeBoard::default())),
+            hop1_ttl_secs: self.hop1_ttl_secs,
+            hunt_sizes: self.hunt_sizes.clone(),
+        };
 
         tokio::spawn(async move {
             run_live_loop(
@@ -219,6 +241,7 @@ impl TitanWsUpstream {
                 rate_limiter,
                 fanout,
                 local_relay,
+                session_ctx,
             )
             .await;
         });
@@ -232,6 +255,7 @@ async fn run_live_loop(
     rate_limiter: UpstreamRateLimiter,
     fanout: RedisFanout,
     local_relay: Option<TitanLocalRelay>,
+    session_ctx: TitanSessionContext,
 ) {
     let mut backoff = ReconnectBackoff::new(Duration::from_secs(5), Duration::from_secs(30));
 
@@ -245,6 +269,7 @@ async fn run_live_loop(
             &rate_limiter,
             &fanout,
             local_relay.as_ref(),
+            &session_ctx,
         )
         .await
         {
@@ -280,6 +305,7 @@ async fn run_session(
     rate_limiter: &UpstreamRateLimiter,
     fanout: &RedisFanout,
     local_relay: Option<&TitanLocalRelay>,
+    session_ctx: &TitanSessionContext,
 ) -> Result<SessionOutcome, WsError> {
     let session_start = Instant::now();
     let mut received_data = false;
@@ -302,6 +328,21 @@ async fn run_session(
     }
     tracing::info!(upstream = "titan_ws", "Titan WebSocket connected");
 
+    {
+        session_ctx
+            .stream_registry
+            .lock()
+            .expect("stream registry lock")
+            .clear();
+    }
+    {
+        session_ctx
+            .size_board
+            .lock()
+            .expect("size board lock")
+            .clear();
+    }
+
     if !rate_limiter.try_acquire() {
         tracing::debug!(upstream = "titan_ws", "rate limit exceeded for GetInfo");
     } else {
@@ -310,37 +351,13 @@ async fn run_session(
         write.send(Message::Binary(get_info)).await?;
     }
 
-    if !rate_limiter.try_acquire() {
-        tracing::debug!(
-            upstream = "titan_ws",
-            "rate limit exceeded for NewSwapQuoteStream"
-        );
-    } else {
-        let input_mint = parse_wallet_pubkey(SOL_MINT).expect("SOL mint constant");
-        let output_mint = parse_wallet_pubkey(USDC_MINT).expect("USDC mint constant");
-        let subscribe = encode_client_request(
-            2,
-            ClientRequestData::NewSwapQuoteStream(NewSwapQuoteStreamRequest {
-                swap: SwapParams {
-                    input_mint,
-                    output_mint,
-                    amount: 1_000_000_000,
-                    slippage_bps: Some(50),
-                },
-                transaction: TransactionParams {
-                    user_public_key: wallet_pubkey,
-                },
-            }),
-        )
-        .map_err(session_encode_error)?;
-        write
-            .send(Message::Binary(subscribe))
-            .await?;
-        tracing::info!(
-            upstream = "titan_ws",
-            "Titan NewSwapQuoteStream subscribed with configured wallet pubkey"
-        );
-    }
+    subscribe_hunt_streams(
+        &mut write,
+        wallet_pubkey,
+        rate_limiter,
+        session_ctx,
+    )
+    .await?;
 
     let mut disconnect_kind = WsDisconnectKind::AbruptClose;
 
@@ -351,7 +368,17 @@ async fn run_session(
                 if let Some(relay) = local_relay {
                     relay.publish_frame(data.clone());
                 }
-                handle_server_message(&data, fanout).await;
+                let kind = handle_titan_server_message(
+                    &data,
+                    fanout,
+                    &session_ctx.stream_registry,
+                    &session_ctx.size_board,
+                    session_ctx.hop1_ttl_secs,
+                )
+                .await;
+                if kind == TitanMessageKind::Hop1Published {
+                    tracing::trace!(upstream = "titan_ws", "hop-1 quote published to redis");
+                }
             }
             Ok(Message::Ping(payload)) => {
                 if let Err(e) = write.send(Message::Pong(payload)).await {
@@ -388,6 +415,65 @@ async fn run_session(
     })
 }
 
+async fn subscribe_hunt_streams(
+    write: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        Message,
+    >,
+    wallet_pubkey: [u8; 32],
+    rate_limiter: &UpstreamRateLimiter,
+    session_ctx: &TitanSessionContext,
+) -> Result<(), WsError> {
+    let input_mint = parse_wallet_pubkey(SOL_MINT).expect("SOL mint constant");
+    let output_mint = parse_wallet_pubkey(USDC_MINT).expect("USDC mint constant");
+
+    for (idx, amount) in session_ctx.hunt_sizes.iter().enumerate() {
+        let request_id = (idx as u64) + 2;
+        if !rate_limiter.try_acquire() {
+            tracing::debug!(
+                upstream = "titan_ws",
+                request_id,
+                amount,
+                "rate limit exceeded for NewSwapQuoteStream"
+            );
+            continue;
+        }
+
+        session_ctx
+            .stream_registry
+            .lock()
+            .expect("stream registry lock")
+            .register_pending_request(request_id, *amount);
+
+        let subscribe = encode_client_request(
+            request_id,
+            ClientRequestData::NewSwapQuoteStream(NewSwapQuoteStreamRequest {
+                swap: SwapParams {
+                    input_mint,
+                    output_mint,
+                    amount: *amount,
+                    slippage_bps: Some(50),
+                },
+                transaction: TransactionParams {
+                    user_public_key: wallet_pubkey,
+                },
+            }),
+        )
+        .map_err(session_encode_error)?;
+        write.send(Message::Binary(subscribe)).await?;
+        tracing::info!(
+            upstream = "titan_ws",
+            request_id,
+            amount_lamports = amount,
+            "Titan NewSwapQuoteStream subscribed for hunt size"
+        );
+    }
+
+    Ok(())
+}
+
 fn session_encode_error(err: rmp_serde::encode::Error) -> WsError {
     WsError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -404,66 +490,6 @@ async fn mark_titan_disconnected(
     fanout.set_titan_upstream_up(false).await;
     if let Some(relay) = local_relay {
         relay.set_upstream_connected(false);
-    }
-}
-
-async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
-    let value = match rmpv::decode::read_value(&mut std::io::Cursor::new(data)) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(upstream = "titan_ws", error = %e, "failed to decode Titan message");
-            fanout.record_titan_decode_error().await;
-            return;
-        }
-    };
-
-    if message_contains_key(&value, "StreamData") {
-        let payload = FeedPayload {
-            event: "titan.quote".to_string(),
-            source: "titan_ws".to_string(),
-            ts: chrono::Utc::now().to_rfc3339(),
-            data: Some(serde_json::json!({
-                "kind": "StreamData",
-                "note": "quote stream update (raw msgpack not forwarded)"
-            })),
-        };
-        match fanout.publish(&payload).await {
-            Ok(_) => {
-                fanout
-                    .record_titan_message(TitanMessageOutcome::QuotePublished)
-                    .await;
-            }
-            Err(e) => {
-                tracing::warn!(upstream = "titan_ws", error = %e, "failed to fan-out Titan quote");
-                fanout
-                    .record_titan_message(TitanMessageOutcome::RpcError)
-                    .await;
-            }
-        }
-    } else if message_contains_key(&value, "Error") {
-        fanout
-            .record_titan_message(TitanMessageOutcome::RpcError)
-            .await;
-        tracing::warn!(
-            upstream = "titan_ws",
-            message = ?value,
-            "Titan WebSocket RPC error"
-        );
-    } else if message_contains_key(&value, "Response") {
-        tracing::debug!(upstream = "titan_ws", "Titan WebSocket RPC response received");
-    } else {
-        fanout
-            .record_titan_message(TitanMessageOutcome::Unhandled)
-            .await;
-    }
-}
-
-fn message_contains_key(value: &rmpv::Value, key: &str) -> bool {
-    match value {
-        rmpv::Value::Map(map) => map.iter().any(|(k, _)| {
-            k.as_str().map(|s| s == key).unwrap_or(false)
-        }),
-        _ => false,
     }
 }
 

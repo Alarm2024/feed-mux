@@ -64,10 +64,14 @@ async fn boot_reset_zeroes_stale_counters_before_heartbeat() {
     let last_frame_ms: String = conn.get(mux_keys::TITAN_LAST_FRAME_MS).await.unwrap();
     let titan_up: String = conn.get(mux_keys::META_TITAN_UP).await.unwrap();
     let pairs_live: String = conn.get(mux_keys::TITAN_PAIRS_LIVE).await.unwrap();
+    let hop1_served: String = conn.get(mux_keys::TITAN_HOP1_SERVED).await.unwrap();
+    let size_board: String = conn.get(mux_keys::TITAN_SIZE_BOARD).await.unwrap();
     assert_eq!(frames, "0");
     assert_eq!(last_frame_ms, "0");
     assert_eq!(titan_up, "0");
     assert_eq!(pairs_live, "0");
+    assert_eq!(hop1_served, "0");
+    assert!(size_board.contains("mux.titan.size_board.v1"));
 
     fanout.heartbeat().await;
     let heartbeat: String = conn.get(mux_keys::META_HEARTBEAT_MS).await.unwrap();

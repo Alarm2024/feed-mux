@@ -138,6 +138,46 @@ Copy [`.env.example`](.env.example). Key settings:
 | `TITAN_WS_URL` | — | Titan Direct WebSocket URL (may include auth query param). Required when `ENABLE_TITAN_WS=true` and `DRY_RUN=false`. |
 | `TITAN_WALLET_PUBKEY` | — | Solana wallet public key (base58). **Required** for live Titan — quotes are subscribed and compiled for this account. Use the **Bot 350 `cheap_2` wallet pubkey only**; never a KEEP / Garden Angel wallet. |
 | `TITAN_RATE_LIMIT_RPS` | `30` | **Separate** Titan rate limit |
+| `TITAN_HUNT_SIZE_LAMPORTS` | *(default ladder)* | Comma-separated SOL hunt sizes in lamports (e.g. `250000000,1000000000,2500000000`) |
+| `TITAN_HOP1_TTL_SECS` | `2` | TTL for per-size hop-1 quote rows in Redis |
+
+### Titan Redis keys (Bot 350 hunt + eyes)
+
+Rust feed-mux owns `mux:titan:*` on FR. **`mux:titan:served` remains downstream proxy-session count only** — hop-1 delivery uses separate keys.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `mux:titan:size_board` | SET (JSON) | Aggregate pin board: per-size hop-1 ages, venue labels, route amounts |
+| `mux:titan:hop1:<BASE>-<MID>:<size_lamports>` | SET + EX | Individual hop-1 quote row for hunt (schema `mux.titan.hop1.v1`) |
+| `mux:titan:hop1_served` | INCR | Count of hop-1 rows written (use for `/titan` hop-1 served, not `mux:titan:served`) |
+| `mux:titan:frames` / `decoded` / `errors` / … | counters | Existing eyes metrics (unchanged) |
+
+**`mux:titan:size_board` schema (`mux.titan.size_board.v1`):**
+
+```json
+{
+  "schema": "mux.titan.size_board.v1",
+  "pair": "SOL-USDC",
+  "base": "SOL",
+  "mid": "USDC",
+  "updated_ms": 1690000000000,
+  "pins": [
+    {
+      "size_lamports": 2500000000,
+      "hop1_age_ms": 12,
+      "hop1_fresh_ms": 1690000000000,
+      "provider": "titan_provider_id",
+      "venue_label": "Orca Whirlpool",
+      "route_in_amount": 2500000000,
+      "route_out_amount": 375000000
+    }
+  ]
+}
+```
+
+**Hop-1 row schema (`mux.titan.hop1.v1`):** JSON at `mux:titan:hop1:SOL-USDC:<size_lamports>` with `provider`, `route_in_amount`, `route_out_amount`, `hop1` leg (venue label, AMM key, mints, amounts), `ts_ms`, `stream_id`, `stream_seq`. TTL defaults to 2s (`TITAN_HOP1_TTL_SECS`).
+
+Live Titan opens one `NewSwapQuoteStream` per hunt size (rate-limited subscribe). Each `StreamData` frame is parsed; the best route’s first `RoutePlanStep` is published as hop-1. Raw frames still relay on `TITAN_LOCAL_BIND` (`127.0.0.1:19001`) for eyes.
 
 ### Upstream activation matrix
 

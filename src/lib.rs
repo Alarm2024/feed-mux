@@ -4,6 +4,7 @@ pub mod mock;
 pub mod rate_limit;
 pub mod redis_fanout;
 pub mod titan_local;
+pub mod titan_quote;
 pub mod upstream;
 pub mod ws_reconnect;
 
