@@ -16,6 +16,7 @@ async fn config_defaults_to_dry_run() {
 #[tokio::test]
 async fn config_defaults_bind_addr_to_loopback() {
     std::env::remove_var("BIND_ADDR");
+    std::env::remove_var("DRY_RUN");
     let config = Config::from_env();
     assert_eq!(
         config.bind_addr, "127.0.0.1:8787",
@@ -47,6 +48,11 @@ async fn redacted_summary_never_contains_redis_password() {
         titan_local_bind: "127.0.0.1:19001".to_string(),
         titan_hunt_size_lamports: None,
         titan_hop1_ttl_secs: 2,
+        enable_triton_shred: false,
+        shred_bind: "0.0.0.0:8003".to_string(),
+        shred_watch_vaults: Vec::new(),
+        shred_hit_ttl_secs: 2,
+        shred_udp_prefix_skip: 0,
         mock_publish_interval_secs: 0,
     };
     let summary = config.redacted_summary();
@@ -136,6 +142,11 @@ fn titan_live_requires_wallet_pubkey() {
         titan_local_bind: "127.0.0.1:19001".to_string(),
         titan_hunt_size_lamports: None,
         titan_hop1_ttl_secs: 2,
+        enable_triton_shred: false,
+        shred_bind: "0.0.0.0:8003".to_string(),
+        shred_watch_vaults: Vec::new(),
+        shred_hit_ttl_secs: 2,
+        shred_udp_prefix_skip: 0,
         mock_publish_interval_secs: 0,
     };
 
@@ -169,6 +180,11 @@ fn titan_dry_run_stays_stub_without_wallet_pubkey() {
         titan_local_bind: "127.0.0.1:19001".to_string(),
         titan_hunt_size_lamports: None,
         titan_hop1_ttl_secs: 2,
+        enable_triton_shred: false,
+        shred_bind: "0.0.0.0:8003".to_string(),
+        shred_watch_vaults: Vec::new(),
+        shred_hit_ttl_secs: 2,
+        shred_udp_prefix_skip: 0,
         mock_publish_interval_secs: 0,
     };
 
@@ -202,6 +218,11 @@ fn triton_live_requires_grpc_url() {
         titan_local_bind: "127.0.0.1:19001".to_string(),
         titan_hunt_size_lamports: None,
         titan_hop1_ttl_secs: 2,
+        enable_triton_shred: false,
+        shred_bind: "0.0.0.0:8003".to_string(),
+        shred_watch_vaults: Vec::new(),
+        shred_hit_ttl_secs: 2,
+        shred_udp_prefix_skip: 0,
         mock_publish_interval_secs: 0,
     };
 

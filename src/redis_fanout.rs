@@ -26,6 +26,13 @@ pub mod mux_keys {
     pub const META_TRITON_UP: &str = "mux:meta:triton_up";
     pub const TRITON_FRAMES: &str = "mux:triton:frames";
     pub const TRITON_LAST_FRAME_MS: &str = "mux:triton:last_frame_ms";
+    pub const META_SHRED_UP: &str = "mux:meta:shred_up";
+    pub const SHRED_SHREDS: &str = "mux:shred:shreds";
+    pub const SHRED_TXS_DESHREDDED: &str = "mux:shred:txs_deshredded";
+    pub const SHRED_VAULT_HITS: &str = "mux:shred:vault_hits";
+    pub const SHRED_LAST_MS: &str = "mux:shred:last_ms";
+    pub const SHRED_LAST_HIT_MS: &str = "mux:shred:last_hit_ms";
+    pub const SHRED_HIT: &str = "mux:shred:hit";
 
     /// Per-size hop-1 quote row: `mux:titan:hop1:<BASE>-<MID>:<size_lamports>`
     pub fn hop1_row_key(pair: &str, size_lamports: u64) -> String {
@@ -178,6 +185,31 @@ impl RedisFanout {
             tracing::warn!(error = %e, "failed to reset mux triton state at boot");
         } else {
             tracing::info!("mux counters reset at boot (rust feed-mux owns mux:* keys)");
+        }
+    }
+
+    /// Clear stale shred mux counters at boot (Bot 350 user=350 ACL keys only).
+    pub async fn reset_shred_state_at_boot(&self) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let zero = "0";
+        let results: Result<((), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
+            .set(mux_keys::META_SHRED_UP, zero)
+            .set(mux_keys::SHRED_SHREDS, zero)
+            .set(mux_keys::SHRED_TXS_DESHREDDED, zero)
+            .set(mux_keys::SHRED_VAULT_HITS, zero)
+            .set(mux_keys::SHRED_LAST_MS, zero)
+            .set(mux_keys::SHRED_LAST_HIT_MS, zero)
+            .del(mux_keys::SHRED_HIT)
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, "failed to reset mux shred state at boot");
         }
     }
 
@@ -347,6 +379,118 @@ impl RedisFanout {
         }
     }
 
+    /// Reflect Triton UDP shred listener connectivity (`mux:meta:shred_up` only).
+    pub async fn set_shred_upstream_up(&self, up: bool) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let flag = if up { "1" } else { "0" };
+        if let Err(e) = conn
+            .set::<_, _, ()>(mux_keys::META_SHRED_UP, flag)
+            .await
+        {
+            tracing::warn!(error = %e, up, "failed to write mux shred_up");
+        }
+    }
+
+    /// Record one UDP shred datagram (`mux:shred:shreds`, `mux:shred:last_ms`).
+    pub async fn record_shred_frame(&self, ts: u64) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let ts_str = ts.to_string();
+        let results: Result<((), (), ()), redis::RedisError> = redis::pipe()
+            .incr(mux_keys::SHRED_SHREDS, 1_i64)
+            .set(mux_keys::SHRED_LAST_MS, &ts_str)
+            .set(mux_keys::META_SHRED_UP, "1")
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, "failed to update mux shred counters");
+        }
+    }
+
+    /// Record deshredded transactions estimate (`mux:shred:txs_deshredded`).
+    pub async fn record_shred_deshred(&self, tx_count: u64, ts: u64) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let ts_str = ts.to_string();
+        let results: Result<((), ()), redis::RedisError> = redis::pipe()
+            .incr(mux_keys::SHRED_TXS_DESHREDDED, tx_count as i64)
+            .set(mux_keys::SHRED_LAST_MS, &ts_str)
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, "failed to update mux shred deshred counters");
+        }
+    }
+
+    /// Publish a vault wake row with TTL honesty (`mux:shred:hit`, counters).
+    pub async fn publish_shred_hit(
+        &self,
+        hit: &crate::shred::VaultHit,
+        slot: u64,
+        fec_set_index: u32,
+        src: &str,
+        ttl_secs: u64,
+        ts: u64,
+    ) {
+        if self.dry_run {
+            tracing::info!(
+                vault = %hit.vault_b58,
+                slot,
+                "dry-run shred vault hit (redis skipped)"
+            );
+            return;
+        }
+
+        let payload = serde_json::json!({
+            "schema": "mux.shred.hit.v1",
+            "vault": hit.vault_b58,
+            "slot": slot,
+            "fec_set_index": fec_set_index,
+            "src": src,
+            "ts_ms": ts,
+        });
+        let json = match serde_json::to_string(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize shred hit");
+                return;
+            }
+        };
+
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+
+        let ttl = ttl_secs.max(1);
+        let ts_str = ts.to_string();
+        let results: Result<((), (), ()), redis::RedisError> = redis::pipe()
+            .set_ex(mux_keys::SHRED_HIT, &json, ttl)
+            .incr(mux_keys::SHRED_VAULT_HITS, 1_i64)
+            .set(mux_keys::SHRED_LAST_HIT_MS, &ts_str)
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, vault = %hit.vault_b58, "failed to publish mux shred hit");
+        }
+    }
+
     /// Record a Triton gRPC slot/update frame.
     pub async fn record_triton_frame(&self) {
         if self.dry_run {
@@ -437,8 +581,15 @@ mod tests {
             mux_keys::META_TRITON_UP,
             mux_keys::TRITON_FRAMES,
             mux_keys::TRITON_LAST_FRAME_MS,
+            mux_keys::META_SHRED_UP,
+            mux_keys::SHRED_SHREDS,
+            mux_keys::SHRED_TXS_DESHREDDED,
+            mux_keys::SHRED_VAULT_HITS,
+            mux_keys::SHRED_LAST_MS,
+            mux_keys::SHRED_LAST_HIT_MS,
+            mux_keys::SHRED_HIT,
         ];
-        assert_eq!(keys.len(), 15);
+        assert_eq!(keys.len(), 22);
         assert_eq!(
             mux_keys::hop1_row_key("SOL-USDC", 1_000_000_000),
             "mux:titan:hop1:SOL-USDC:1000000000"
@@ -461,7 +612,9 @@ mod tests {
         fanout.set_titan_upstream_up(true).await;
         fanout.set_titan_upstream_up(false).await;
         fanout.set_triton_upstream_up(true).await;
+        fanout.set_shred_upstream_up(true).await;
         fanout.record_triton_frame().await;
+        fanout.record_shred_frame(now_ms()).await;
         fanout.record_titan_decode_error().await;
         fanout
             .record_titan_message(TitanMessageOutcome::QuotePublished)

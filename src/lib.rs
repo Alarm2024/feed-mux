@@ -3,6 +3,7 @@ pub mod http;
 pub mod mock;
 pub mod rate_limit;
 pub mod redis_fanout;
+pub mod shred;
 pub mod titan_local;
 pub mod titan_quote;
 pub mod triton_local;
@@ -50,6 +51,7 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
     } else {
         fanout.reset_titan_state_at_boot().await;
         upstreams.spawn_live(
+            &config,
             fanout.clone(),
             Some(titan_local_relay),
             Some(triton_local_relay),

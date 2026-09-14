@@ -208,6 +208,11 @@ fn triton_status_not_connected_before_stream_up() {
         titan_local_bind: "127.0.0.1:19001".to_string(),
         titan_hunt_size_lamports: None,
         titan_hop1_ttl_secs: 2,
+        enable_triton_shred: false,
+        shred_bind: "0.0.0.0:8003".to_string(),
+        shred_watch_vaults: Vec::new(),
+        shred_hit_ttl_secs: 2,
+        shred_udp_prefix_skip: 0,
         mock_publish_interval_secs: 0,
     };
 
