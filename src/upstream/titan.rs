@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -11,7 +11,11 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::config::{parse_wallet_pubkey, Config};
 use crate::rate_limit::UpstreamRateLimiter;
-use crate::redis_fanout::{FeedPayload, RedisFanout, TitanMessageOutcome};
+use crate::redis_fanout::{now_ms, FeedPayload, RedisFanout, TitanMessageOutcome};
+use crate::titan_board::{
+    parse_board_sizes, parse_stream_data_quotes, Hop1QuoteDelivery, SizeBoard, SizeBoardEntry,
+    USDC_MINT, SOL_MINT,
+};
 use crate::titan_local::TitanLocalRelay;
 use crate::upstream::UpstreamStatus;
 use crate::ws_reconnect::{
@@ -20,8 +24,6 @@ use crate::ws_reconnect::{
 };
 
 pub const TITAN_WS_PROTOCOL: &str = "v1.api.titan.ag";
-const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
-const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TitanLiveState {
@@ -48,6 +50,7 @@ pub struct TitanWsUpstream {
     live_state: TitanLiveState,
     rate_limit_rps: u32,
     rate_limiter: UpstreamRateLimiter,
+    board_sizes_lamports: Vec<u64>,
     connected: Arc<AtomicBool>,
 }
 
@@ -101,6 +104,7 @@ impl TitanWsUpstream {
             live_state,
             rate_limit_rps: config.titan_rate_limit_rps,
             rate_limiter: UpstreamRateLimiter::new("titan_ws", config.titan_rate_limit_rps),
+            board_sizes_lamports: parse_board_sizes(config.titan_board_sizes_lamports.as_deref()),
             connected: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -210,6 +214,7 @@ impl TitanWsUpstream {
             .expect("ready state implies wallet pubkey bytes");
         let connected = Arc::clone(&self.connected);
         let rate_limiter = self.rate_limiter.clone();
+        let board_sizes = self.board_sizes_lamports.clone();
 
         tokio::spawn(async move {
             run_live_loop(
@@ -217,6 +222,7 @@ impl TitanWsUpstream {
                 wallet_pubkey,
                 connected,
                 rate_limiter,
+                board_sizes,
                 fanout,
                 local_relay,
             )
@@ -230,6 +236,7 @@ async fn run_live_loop(
     wallet_pubkey: [u8; 32],
     connected: Arc<AtomicBool>,
     rate_limiter: UpstreamRateLimiter,
+    board_sizes: Vec<u64>,
     fanout: RedisFanout,
     local_relay: Option<TitanLocalRelay>,
 ) {
@@ -243,6 +250,7 @@ async fn run_live_loop(
             wallet_pubkey,
             &connected,
             &rate_limiter,
+            &board_sizes,
             &fanout,
             local_relay.as_ref(),
         )
@@ -278,6 +286,7 @@ async fn run_session(
     wallet_pubkey: [u8; 32],
     connected: &Arc<AtomicBool>,
     rate_limiter: &UpstreamRateLimiter,
+    board_sizes: &[u64],
     fanout: &RedisFanout,
     local_relay: Option<&TitanLocalRelay>,
 ) -> Result<SessionOutcome, WsError> {
@@ -310,21 +319,27 @@ async fn run_session(
         write.send(Message::Binary(get_info)).await?;
     }
 
-    if !rate_limiter.try_acquire() {
-        tracing::debug!(
-            upstream = "titan_ws",
-            "rate limit exceeded for NewSwapQuoteStream"
-        );
-    } else {
-        let input_mint = parse_wallet_pubkey(SOL_MINT).expect("SOL mint constant");
-        let output_mint = parse_wallet_pubkey(USDC_MINT).expect("USDC mint constant");
+    let input_mint = parse_wallet_pubkey(SOL_MINT).expect("SOL mint constant");
+    let output_mint = parse_wallet_pubkey(USDC_MINT).expect("USDC mint constant");
+    let size_board_state = Arc::new(Mutex::new(SizeBoard::new(now_ms())));
+
+    let mut request_id: u64 = 2;
+    for size in board_sizes {
+        if !rate_limiter.try_acquire() {
+            tracing::debug!(
+                upstream = "titan_ws",
+                size_lamports = size,
+                "rate limit exceeded for NewSwapQuoteStream"
+            );
+            continue;
+        }
         let subscribe = encode_client_request(
-            2,
+            request_id,
             ClientRequestData::NewSwapQuoteStream(NewSwapQuoteStreamRequest {
                 swap: SwapParams {
                     input_mint,
                     output_mint,
-                    amount: 1_000_000_000,
+                    amount: *size,
                     slippage_bps: Some(50),
                 },
                 transaction: TransactionParams {
@@ -333,13 +348,13 @@ async fn run_session(
             }),
         )
         .map_err(session_encode_error)?;
-        write
-            .send(Message::Binary(subscribe))
-            .await?;
+        write.send(Message::Binary(subscribe)).await?;
         tracing::info!(
             upstream = "titan_ws",
-            "Titan NewSwapQuoteStream subscribed with configured wallet pubkey"
+            size_lamports = size,
+            "Titan NewSwapQuoteStream subscribed for board size"
         );
+        request_id += 1;
     }
 
     let mut disconnect_kind = WsDisconnectKind::AbruptClose;
@@ -351,7 +366,8 @@ async fn run_session(
                 if let Some(relay) = local_relay {
                     relay.publish_frame(data.clone());
                 }
-                handle_server_message(&data, fanout).await;
+                handle_server_message(&data, fanout, board_sizes, Arc::clone(&size_board_state))
+                    .await;
             }
             Ok(Message::Ping(payload)) => {
                 if let Err(e) = write.send(Message::Pong(payload)).await {
@@ -407,7 +423,12 @@ async fn mark_titan_disconnected(
     }
 }
 
-async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
+async fn handle_server_message(
+    data: &[u8],
+    fanout: &RedisFanout,
+    board_sizes: &[u64],
+    size_board_state: Arc<Mutex<SizeBoard>>,
+) {
     let value = match rmpv::decode::read_value(&mut std::io::Cursor::new(data)) {
         Ok(v) => v,
         Err(e) => {
@@ -418,13 +439,63 @@ async fn handle_server_message(data: &[u8], fanout: &RedisFanout) {
     };
 
     if message_contains_key(&value, "StreamData") {
+        let quote_ms = now_ms();
+        let parsed = parse_stream_data_quotes(data);
+        let size_lamports = parsed
+            .as_ref()
+            .and_then(|q| q.amount)
+            .or_else(|| board_sizes.first().copied())
+            .unwrap_or(0);
+
+        let (age_ms, board) = {
+            let mut board = size_board_state.lock().expect("size board lock");
+            let age_ms = board
+                .sizes
+                .iter()
+                .find(|e| e.size_lamports == size_lamports)
+                .map(|e| quote_ms.saturating_sub(e.hop1_last_ms))
+                .unwrap_or(0);
+            board.upsert(
+                SizeBoardEntry {
+                    size_lamports,
+                    hop1_age_ms: age_ms,
+                    hop1_last_ms: quote_ms,
+                },
+                quote_ms,
+            );
+            (age_ms, board.clone())
+        };
+
+        let hop1 = Hop1QuoteDelivery {
+            size_lamports,
+            input_mint: parsed
+                .as_ref()
+                .and_then(|q| q.input_mint.clone())
+                .unwrap_or_else(|| SOL_MINT.to_string()),
+            output_mint: parsed
+                .as_ref()
+                .and_then(|q| q.output_mint.clone())
+                .unwrap_or_else(|| USDC_MINT.to_string()),
+            hop: 1,
+            out_amount: parsed.as_ref().and_then(|q| q.out_amount),
+            provider: parsed.as_ref().and_then(|q| q.provider.clone()),
+            quote_ms,
+            age_ms,
+            source: "titan_ws".to_string(),
+        };
+        fanout.publish_hop1_quote(&hop1, &board).await;
+
         let payload = FeedPayload {
-            event: "titan.quote".to_string(),
+            event: "titan.hop1.quote".to_string(),
             source: "titan_ws".to_string(),
             ts: chrono::Utc::now().to_rfc3339(),
             data: Some(serde_json::json!({
                 "kind": "StreamData",
-                "note": "quote stream update (raw msgpack not forwarded)"
+                "hop": 1,
+                "size_lamports": size_lamports,
+                "out_amount": hop1.out_amount,
+                "provider": hop1.provider,
+                "redis_key": crate::titan_board::hop1_redis_key(size_lamports),
             })),
         };
         match fanout.publish(&payload).await {

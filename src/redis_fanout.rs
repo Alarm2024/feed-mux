@@ -5,10 +5,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
-// Bot 350 mux Redis metrics (`mux:titan:*`, `mux:meta:heartbeat_ms`, `mux:meta:titan_up`).
+use crate::titan_board::{Hop1QuoteDelivery, SizeBoard};
+
+// Bot 350 mux Redis metrics (`mux:titan:*`, `mux:meta:*`).
 // Rust feed-mux owns these keys on FR; the legacy Python mux is dead — no dual-write.
 
-/// Redis keys read by Bot 350 eyes (legacy Python mux schema).
+/// Redis keys read by Bot 350 eyes (legacy Python mux schema + hop-1 hunt delivery).
 pub mod mux_keys {
     pub const TITAN_FRAMES: &str = "mux:titan:frames";
     pub const TITAN_DECODED: &str = "mux:titan:decoded";
@@ -18,8 +20,12 @@ pub mod mux_keys {
     pub const TITAN_PAIRS_LIVE: &str = "mux:titan:pairs_live";
     pub const TITAN_LAST_FRAME_MS: &str = "mux:titan:last_frame_ms";
     pub const TITAN_FRESHEST_MS: &str = "mux:titan:freshest_ms";
+    pub const TITAN_SIZE_BOARD: &str = "mux:titan:size_board";
     pub const META_HEARTBEAT_MS: &str = "mux:meta:heartbeat_ms";
     pub const META_TITAN_UP: &str = "mux:meta:titan_up";
+    pub const META_TRITON_UP: &str = "mux:meta:triton_up";
+    pub const TRITON_FRAMES: &str = "mux:triton:frames";
+    pub const TRITON_LAST_FRAME_MS: &str = "mux:triton:last_frame_ms";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -126,9 +132,8 @@ impl RedisFanout {
         })
     }
 
-    /// Clear stale Titan mux counters left by the dead Python mux or a prior process.
-    /// Called once at boot before the heartbeat task starts so eyes never inherit ghost frames.
-    pub async fn reset_titan_state_at_boot(&self) {
+    /// Clear stale mux counters left by the dead Python mux or a prior process.
+    pub async fn reset_mux_state_at_boot(&self) {
         if self.dry_run {
             return;
         }
@@ -137,7 +142,23 @@ impl RedisFanout {
             return;
         };
         let zero = "0";
-        let results: Result<((), (), (), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
+        let results: Result<
+            (
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+                (),
+            ),
+            redis::RedisError,
+        > = redis::pipe()
             .set(mux_keys::TITAN_FRAMES, zero)
             .set(mux_keys::TITAN_DECODED, zero)
             .set(mux_keys::TITAN_ERRORS, zero)
@@ -147,12 +168,16 @@ impl RedisFanout {
             .set(mux_keys::TITAN_LAST_FRAME_MS, zero)
             .set(mux_keys::TITAN_FRESHEST_MS, zero)
             .set(mux_keys::META_TITAN_UP, zero)
+            .set(mux_keys::META_TRITON_UP, zero)
+            .set(mux_keys::TRITON_FRAMES, zero)
+            .set(mux_keys::TRITON_LAST_FRAME_MS, zero)
+            .del(mux_keys::TITAN_SIZE_BOARD)
             .query_async(conn)
             .await;
         if let Err(e) = results {
-            tracing::warn!(error = %e, "failed to reset mux titan state at boot");
+            tracing::warn!(error = %e, "failed to reset mux state at boot");
         } else {
-            tracing::info!("mux titan counters reset at boot (rust feed-mux owns mux:titan:* keys)");
+            tracing::info!("mux counters reset at boot (rust feed-mux owns mux:* keys)");
         }
     }
 
@@ -175,7 +200,6 @@ impl RedisFanout {
     }
 
     /// Reflect Titan WS upstream connectivity (`mux:meta:titan_up` only).
-    /// `pairs_live` is set only after a real quote decode/publish — never on handshake.
     pub async fn set_titan_upstream_up(&self, up: bool) {
         if self.dry_run {
             return;
@@ -198,6 +222,82 @@ impl RedisFanout {
             {
                 tracing::warn!(error = %e, "failed to clear mux pairs_live on disconnect");
             }
+        }
+    }
+
+    /// Reflect Triton gRPC upstream connectivity (`mux:meta:triton_up`).
+    pub async fn set_triton_upstream_up(&self, up: bool) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let flag = if up { "1" } else { "0" };
+        if let Err(e) = conn
+            .set::<_, _, ()>(mux_keys::META_TRITON_UP, flag)
+            .await
+        {
+            tracing::warn!(error = %e, up, "failed to write mux triton_up");
+        }
+    }
+
+    /// Record a Triton gRPC slot/update frame.
+    pub async fn record_triton_frame(&self) {
+        if self.dry_run {
+            return;
+        }
+        let ts = now_ms();
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let ts_str = ts.to_string();
+        let results: Result<((), (), ()), redis::RedisError> = redis::pipe()
+            .incr(mux_keys::TRITON_FRAMES, 1_i64)
+            .set(mux_keys::TRITON_LAST_FRAME_MS, &ts_str)
+            .set(mux_keys::META_TRITON_UP, "1")
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, "failed to update mux triton counters");
+        }
+    }
+
+    /// Publish hop-1 quote delivery key and refresh size board entry.
+    pub async fn publish_hop1_quote(&self, quote: &Hop1QuoteDelivery, board: &SizeBoard) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+
+        let hop1_key = crate::titan_board::hop1_redis_key(quote.size_lamports);
+        let quote_json = match serde_json::to_string(quote) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize hop1 quote");
+                return;
+            }
+        };
+        let board_json = match serde_json::to_string(board) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to serialize size board");
+                return;
+            }
+        };
+
+        let results: Result<((), ()), redis::RedisError> = redis::pipe()
+            .set(&hop1_key, &quote_json)
+            .set(mux_keys::TITAN_SIZE_BOARD, &board_json)
+            .query_async(conn)
+            .await;
+        if let Err(e) = results {
+            tracing::warn!(error = %e, size = quote.size_lamports, "failed to publish hop1 quote");
         }
     }
 
@@ -231,7 +331,6 @@ impl RedisFanout {
             return;
         };
         let ts_str = ts.to_string();
-        // `served` is downstream-only in the legacy schema — never mirror decode count here.
         let results: Result<((), (), (), (), (), ()), redis::RedisError> = redis::pipe()
             .incr(mux_keys::TITAN_FRAMES, 1_i64)
             .incr(mux_keys::TITAN_DECODED, 1_i64)
@@ -280,6 +379,7 @@ pub struct PublishResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::titan_board::{SizeBoard, SizeBoardEntry};
 
     #[test]
     fn mux_key_schema_matches_bot350_eyes() {
@@ -292,10 +392,14 @@ mod tests {
             mux_keys::TITAN_PAIRS_LIVE,
             mux_keys::TITAN_LAST_FRAME_MS,
             mux_keys::TITAN_FRESHEST_MS,
+            mux_keys::TITAN_SIZE_BOARD,
             mux_keys::META_HEARTBEAT_MS,
             mux_keys::META_TITAN_UP,
+            mux_keys::META_TRITON_UP,
+            mux_keys::TRITON_FRAMES,
+            mux_keys::TRITON_LAST_FRAME_MS,
         ];
-        assert_eq!(keys.len(), 10);
+        assert_eq!(keys.len(), 14);
         for key in keys {
             assert!(key.starts_with("mux:"));
         }
@@ -306,22 +410,49 @@ mod tests {
         assert!(now_ms() > 0);
     }
 
+    #[test]
+    fn hop1_key_pattern_documented() {
+        let key = crate::titan_board::hop1_redis_key(2_500_000_035);
+        assert_eq!(key, "mux:titan:hop1:2500000035");
+    }
+
     #[tokio::test]
     async fn dry_run_metrics_are_no_ops() {
         let fanout = RedisFanout::connect(None, "feed:350".to_string(), true).await;
-        fanout.reset_titan_state_at_boot().await;
+        fanout.reset_mux_state_at_boot().await;
         fanout.heartbeat().await;
         fanout.set_titan_upstream_up(true).await;
         fanout.set_titan_upstream_up(false).await;
+        fanout.set_triton_upstream_up(true).await;
+        fanout.record_triton_frame().await;
         fanout.record_titan_decode_error().await;
         fanout
             .record_titan_message(TitanMessageOutcome::QuotePublished)
             .await;
+        let mut board = SizeBoard::new(now_ms());
+        board.upsert(
+            SizeBoardEntry {
+                size_lamports: 2_500_000_035,
+                hop1_age_ms: 0,
+                hop1_last_ms: now_ms(),
+            },
+            now_ms(),
+        );
         fanout
-            .record_titan_message(TitanMessageOutcome::RpcError)
-            .await;
-        fanout
-            .record_titan_message(TitanMessageOutcome::Unhandled)
+            .publish_hop1_quote(
+                &crate::titan_board::Hop1QuoteDelivery {
+                    size_lamports: 2_500_000_035,
+                    input_mint: crate::titan_board::SOL_MINT.to_string(),
+                    output_mint: crate::titan_board::USDC_MINT.to_string(),
+                    hop: 1,
+                    out_amount: Some(1),
+                    provider: None,
+                    quote_ms: now_ms(),
+                    age_ms: 0,
+                    source: "titan_ws".to_string(),
+                },
+                &board,
+            )
             .await;
     }
 }
