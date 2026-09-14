@@ -138,6 +138,77 @@ where
         .map_err(|e| tracing::trace!(error = %e, "failed to close WebSocket write half"));
 }
 
+/// Why a gRPC stream session ended — drives reconnect vs halt decisions for Triton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcStreamFailure {
+    /// Transient network/protocol issue — backoff and retry.
+    Retryable,
+    /// Auth, plan, or permission denial — do not reconnect until process restart.
+    AuthDenied,
+}
+
+/// Classify Triton/Yellowstone gRPC stream errors without logging secrets.
+///
+/// HTTP 403/401 bodies are often mis-parsed as gRPC frames ("invalid compression flag")
+/// when the provider rejects the x-token or plan.
+pub fn classify_grpc_stream_error(err: &str) -> GrpcStreamFailure {
+    let lower = err.to_ascii_lowercase();
+
+    if lower.contains("403 forbidden")
+        || lower.contains("status: 403")
+        || lower.contains("401 unauthorized")
+        || lower.contains("status: 401")
+        || lower.contains("permissiondenied")
+        || lower.contains("unauthenticated")
+        || lower.contains("access denied")
+        || (lower.contains("invalid compression flag") && lower.contains("403"))
+    {
+        return GrpcStreamFailure::AuthDenied;
+    }
+
+    GrpcStreamFailure::Retryable
+}
+
+/// Short, safe gRPC error summary — never includes URLs or auth tokens.
+pub fn grpc_error_summary(err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("403 forbidden") || lower.contains("status: 403") {
+        return "HTTP 403 Forbidden (check TRITON_GRPC_TOKEN/plan)".to_string();
+    }
+    if lower.contains("401 unauthorized") || lower.contains("status: 401") {
+        return "HTTP 401 Unauthorized (check TRITON_GRPC_TOKEN)".to_string();
+    }
+    if lower.contains("invalid compression flag") && lower.contains("403") {
+        return "HTTP 403 rejected as non-gRPC body (check TRITON_GRPC_TOKEN/plan)".to_string();
+    }
+    if err.len() > 200 {
+        format!("{}…", &err[..200])
+    } else {
+        err.to_string()
+    }
+}
+
+/// Emit exactly one reconnect log line for a gRPC stream disconnect (retryable only).
+pub fn log_grpc_reconnect(upstream: &'static str, delay: Duration, detail: Option<&str>) {
+    let delay_secs = delay.as_secs();
+    if let Some(detail) = detail {
+        tracing::warn!(
+            upstream,
+            reason = detail,
+            delay_secs,
+            "Triton gRPC stream error; reconnecting in {}s",
+            delay_secs
+        );
+    } else {
+        tracing::warn!(
+            upstream,
+            delay_secs,
+            "Triton gRPC stream ended; reconnecting in {}s",
+            delay_secs
+        );
+    }
+}
+
 /// Emit exactly one reconnect log line for a disconnect.
 pub fn log_ws_reconnect(
     upstream: &'static str,
@@ -258,5 +329,31 @@ mod tests {
         assert!(!summary.contains("token"));
         assert!(!summary.contains("password"));
         assert!(!summary.contains("wss://"));
+    }
+
+    #[test]
+    fn grpc_403_with_compression_flag_is_auth_denied() {
+        let err = r#"Triton stream error: code: 'Internal error', message: "protocol error: received message with invalid compression flag: 32 (valid flags are 0 and 1) while receiving response with status: 403 Forbidden""#;
+        assert_eq!(
+            classify_grpc_stream_error(err),
+            GrpcStreamFailure::AuthDenied
+        );
+    }
+
+    #[test]
+    fn grpc_transient_error_is_retryable() {
+        let err = "Triton gRPC connect failed: connection reset";
+        assert_eq!(
+            classify_grpc_stream_error(err),
+            GrpcStreamFailure::Retryable
+        );
+    }
+
+    #[test]
+    fn grpc_error_summary_masks_forbidden() {
+        let err = "status: 403 Forbidden secret-token=abc123";
+        let summary = grpc_error_summary(err);
+        assert!(summary.contains("403"));
+        assert!(!summary.contains("abc123"));
     }
 }

@@ -14,7 +14,10 @@ use crate::rate_limit::UpstreamRateLimiter;
 use crate::redis_fanout::{FeedPayload, RedisFanout};
 use crate::triton_local::TritonLocalRelay;
 use crate::upstream::UpstreamStatus;
-use crate::ws_reconnect::{log_ws_reconnect, ReconnectBackoff, WsDisconnectKind};
+use crate::ws_reconnect::{
+    classify_grpc_stream_error, grpc_error_summary, log_grpc_reconnect, GrpcStreamFailure,
+    ReconnectBackoff,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TritonLiveState {
@@ -33,6 +36,7 @@ pub struct TritonGrpcUpstream {
     rate_limiter: UpstreamRateLimiter,
     live_state: TritonLiveState,
     connected: Arc<AtomicBool>,
+    auth_blocked: Arc<AtomicBool>,
 }
 
 impl TritonGrpcUpstream {
@@ -48,6 +52,16 @@ impl TritonGrpcUpstream {
                     );
                 }
                 TritonLiveState::Ready => {
+                    if config
+                        .triton_grpc_token
+                        .as_ref()
+                        .is_none_or(|s| s.trim().is_empty())
+                    {
+                        tracing::warn!(
+                            upstream = "triton_grpc",
+                            "TRITON_GRPC_TOKEN is not set; Triton may reject the stream with 403"
+                        );
+                    }
                     tracing::info!(
                         upstream = "triton_grpc",
                         rate_limit_rps = config.triton_rate_limit_rps,
@@ -67,6 +81,7 @@ impl TritonGrpcUpstream {
             rate_limiter: UpstreamRateLimiter::new("triton_grpc", config.triton_rate_limit_rps),
             live_state,
             connected: Arc::new(AtomicBool::new(false)),
+            auth_blocked: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -92,6 +107,16 @@ impl TritonGrpcUpstream {
     }
 
     pub fn status(&self) -> UpstreamStatus {
+        if self.auth_blocked.load(Ordering::Relaxed) {
+            return UpstreamStatus {
+                name: "triton_grpc",
+                enabled: self.enabled,
+                connected: false,
+                mode: "error/auth-denied",
+                rate_limit_rps: Some(self.rate_limit_rps),
+            };
+        }
+
         let (connected, mode) = match self.live_state {
             TritonLiveState::Disabled => (false, "disabled"),
             TritonLiveState::DryRunStub => (false, "stub/dry-run"),
@@ -143,6 +168,7 @@ impl TritonGrpcUpstream {
         tracing::trace!(
             upstream = "triton_grpc",
             connected = self.connected.load(Ordering::Relaxed),
+            auth_blocked = self.auth_blocked.load(Ordering::Relaxed),
             "Triton gRPC live poll (handled by background task)"
         );
     }
@@ -158,6 +184,7 @@ impl TritonGrpcUpstream {
             .expect("ready state implies grpc url");
         let grpc_token = self.grpc_token.clone();
         let connected = Arc::clone(&self.connected);
+        let auth_blocked = Arc::clone(&self.auth_blocked);
         let rate_limiter = self.rate_limiter.clone();
 
         tokio::spawn(async move {
@@ -165,6 +192,7 @@ impl TritonGrpcUpstream {
                 grpc_url,
                 grpc_token,
                 connected,
+                auth_blocked,
                 rate_limiter,
                 fanout,
                 local_relay,
@@ -178,6 +206,7 @@ async fn run_live_loop(
     grpc_url: String,
     grpc_token: Option<String>,
     connected: Arc<AtomicBool>,
+    auth_blocked: Arc<AtomicBool>,
     rate_limiter: UpstreamRateLimiter,
     fanout: RedisFanout,
     local_relay: Option<TritonLocalRelay>,
@@ -202,22 +231,46 @@ async fn run_live_loop(
                     backoff.reset();
                 }
                 let delay = backoff.next_delay();
-                log_ws_reconnect("triton_grpc", WsDisconnectKind::AbruptClose, delay, None);
+                log_grpc_reconnect("triton_grpc", delay, None);
                 mark_triton_disconnected(&connected, &fanout, local_relay.as_ref()).await;
                 backoff.wait().await;
             }
             Err(e) => {
                 mark_triton_disconnected(&connected, &fanout, local_relay.as_ref()).await;
-                let delay = backoff.next_delay();
-                log_ws_reconnect(
-                    "triton_grpc",
-                    WsDisconnectKind::TransportError,
-                    delay,
-                    Some(&e),
-                );
-                backoff.wait().await;
+                match classify_grpc_stream_error(&e) {
+                    GrpcStreamFailure::AuthDenied => {
+                        auth_blocked.store(true, Ordering::Relaxed);
+                        tracing::error!(
+                            upstream = "triton_grpc",
+                            reason = %grpc_error_summary(&e),
+                            "Triton gRPC access denied — check TRITON_GRPC_TOKEN and plan; upstream halted (no reconnect until restart)"
+                        );
+                        break;
+                    }
+                    GrpcStreamFailure::Retryable => {
+                        let delay = backoff.next_delay();
+                        log_grpc_reconnect(
+                            "triton_grpc",
+                            delay,
+                            Some(&grpc_error_summary(&e)),
+                        );
+                        backoff.wait().await;
+                    }
+                }
             }
         }
+    }
+}
+
+fn normalize_grpc_endpoint(url: &str) -> Result<String, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("empty Triton gRPC URL".to_string());
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Ok(trimmed.to_string())
+    } else {
+        Ok(format!("https://{trimmed}"))
     }
 }
 
@@ -233,10 +286,12 @@ async fn run_session(
         return Err("rate limit exceeded for Triton subscribe".to_string());
     }
 
-    let mut builder = GeyserGrpcClient::build_from_shared(grpc_url.to_string())
+    let endpoint = normalize_grpc_endpoint(grpc_url)?;
+
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint.clone())
         .map_err(|e| format!("invalid Triton gRPC URL: {e}"))?;
 
-    if grpc_url.starts_with("https://") {
+    if endpoint.starts_with("https://") {
         builder = builder
             .tls_config(yellowstone_grpc_client::ClientTlsConfig::new().with_native_roots())
             .map_err(|e| format!("Triton TLS config failed: {e}"))?;
@@ -342,5 +397,64 @@ async fn handle_triton_update(update: &SubscribeUpdate, fanout: &RedisFanout) {
 
     if let Err(e) = fanout.publish(&payload).await {
         tracing::warn!(upstream = "triton_grpc", error = %e, "failed to fan-out Triton update");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn live_config(token: Option<&str>) -> Config {
+        Config {
+            bind_addr: "127.0.0.1:8787".to_string(),
+            dry_run: false,
+            redis_url: None,
+            redis_channel: "feed:350".to_string(),
+            enable_chainstack: false,
+            chainstack_rpc_url: None,
+            chainstack_ws_url: None,
+            enable_helius: false,
+            helius_rpc_url: None,
+            enable_triton_grpc: true,
+            triton_grpc_url: Some("grpc.example.test".to_string()),
+            triton_grpc_token: token.map(|s| s.to_string()),
+            triton_rate_limit_rps: 25,
+            triton_local_bind: "127.0.0.1:19000".to_string(),
+            enable_titan_ws: false,
+            titan_ws_url: None,
+            titan_wallet_pubkey: None,
+            titan_rate_limit_rps: 15,
+            titan_local_bind: "127.0.0.1:19001".to_string(),
+            titan_hunt_size_lamports: None,
+            titan_hop1_ttl_secs: 2,
+            enable_triton_shred: false,
+            shred_bind: "0.0.0.0:8003".to_string(),
+            shred_watch_vaults: Vec::new(),
+            shred_hit_ttl_secs: 2,
+            shred_udp_prefix_skip: 0,
+            mock_publish_interval_secs: 0,
+        }
+    }
+
+    #[test]
+    fn normalize_grpc_endpoint_adds_https_scheme() {
+        assert_eq!(
+            normalize_grpc_endpoint("grpc.example.test").unwrap(),
+            "https://grpc.example.test"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint("https://grpc.example.test").unwrap(),
+            "https://grpc.example.test"
+        );
+    }
+
+    #[test]
+    fn auth_blocked_status_is_honest() {
+        let upstream = TritonGrpcUpstream::new(&live_config(Some("token")));
+        upstream.auth_blocked.store(true, Ordering::Relaxed);
+        let status = upstream.status();
+        assert_eq!(status.mode, "error/auth-denied");
+        assert!(!status.connected);
     }
 }
