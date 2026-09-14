@@ -25,3 +25,25 @@ feed-mux now publishes Titan hop-1 hunt data to Redis. Bot 350 must consume it f
 - Send / execution — eyes and delivery only
 
 See README **Titan Redis keys** for full JSON schemas.
+
+---
+
+## Triton UDP shreds (this PR)
+
+feed-mux binds **`SHRED_BIND` (default `:8003`)** — KEEP stays alone on `:8002` forever.
+
+### FR ops
+
+If Triton allows only one UDP destination today, open an FR ticket for a **second shred fan-out** to mux `:8003`. Do not tee from KEEP’s socket and do not change KEEP code.
+
+### Bot 350 follow-up (separate PR on Alarm2024/350)
+
+350 should consume mux shred wakes for early scan:
+
+| Signal | Use |
+|--------|-----|
+| `mux:shred:hit` | Latest vault hit row (`mux.shred.hit.v1`, TTL ~2s) |
+| `feed:350` `shred.vault_hit` | Pub/sub wake for immediate rescan |
+| `mux:shred:last_hit_ms` / `vault_hits` | Eyes freshness on `/shred` or hunt card |
+
+Suggested 350 change: on `mux:shred:hit` or pub/sub wake, trigger early vault scan for the named pubkey — **dry eyes only**, no send path, no Titan quote fabrication.

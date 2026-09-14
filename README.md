@@ -17,6 +17,7 @@ Local fan-out feed multiplexer for **Bot 350** (primary consumer) and the **pyth
 | **No shared hop** | No shared Titan/Triton path with KEEP — mux is a **separate service** |
 | **KEEP stays off** | `feed.redis_url` on KEEP remains **disabled forever** |
 | **Separate rate limits** | Triton gRPC and Titan WS are rate-limited **independently** |
+| **KEEP shred port** | KEEP arb-bot owns UDP `:8002` forever — mux uses **`SHRED_BIND` (default `:8003`)** |
 | **Secrets** | Redis AUTH supported; credentials are **never logged** |
 
 ---
@@ -179,12 +180,39 @@ Rust feed-mux owns `mux:titan:*` on FR. **`mux:titan:served` remains downstream 
 
 Live Titan opens one `NewSwapQuoteStream` per hunt size (rate-limited subscribe). Each `StreamData` frame is parsed; the best route’s first `RoutePlanStep` is published as hop-1. Raw frames still relay on `TITAN_LOCAL_BIND` (`127.0.0.1:19001`) for eyes.
 
+### Triton UDP shreds (Bot 350 dry eyes)
+
+Mux listens on its **own** UDP bind (`SHRED_BIND`, default `0.0.0.0:8003`) — **not** KEEP’s `:8002`. Wyndham-approved path: request a **second Triton shred destination** from your provider pointed at mux. No KEEP code changes; no shared socket; no send path.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENABLE_TRITON_SHRED` | `false` | Bind UDP + deshred/scan when `DRY_RUN=false` |
+| `SHRED_BIND` | `0.0.0.0:8003` | **Must not be `:8002`** (KEEP conflict) |
+| `SHRED_WATCH_VAULTS` | — | Comma-separated vault pubkeys (base58) for Bot 350 |
+| `SHRED_HIT_TTL_SECS` | `2` | TTL for `mux:shred:hit` wake rows |
+| `SHRED_UDP_PREFIX_SKIP` | `0` | Leading bytes to strip per datagram |
+
+**Shred Redis keys (`user=350` ACL):**
+
+| Key | Description |
+|-----|-------------|
+| `mux:shred:shreds` | UDP datagram counter |
+| `mux:shred:txs_deshredded` | Deshredded transaction estimate |
+| `mux:shred:vault_hits` | Watched-vault hit counter |
+| `mux:shred:last_ms` | Last shred timestamp (ms) |
+| `mux:shred:last_hit_ms` | Last vault hit timestamp (ms) |
+| `mux:shred:hit` | Latest hit JSON (`mux.shred.hit.v1`, TTL) |
+| `mux:meta:shred_up` | UDP listener up (`1`/`0`) |
+
+`/health` includes a `shred` object with the same counters plus `last_age_ms`. Pub/sub wake events use `event=shred.vault_hit` on `feed:350`.
+
 ### Upstream activation matrix
 
 | Upstream | Dry-run (`DRY_RUN=true`) | Live (`DRY_RUN=false`) |
 |----------|--------------------------|-------------------------|
 | Helius | Stub poll only | Requires `ENABLE_HELIUS=true` + `HELIUS_RPC_URL` |
 | Triton gRPC | Stub poll, rate-limited | Requires `ENABLE_TRITON_GRPC=true` + `TRITON_GRPC_URL`, rate-limited |
+| Triton UDP shreds | Stub poll | Requires `ENABLE_TRITON_SHRED=true` + `SHRED_WATCH_VAULTS` + separate `SHRED_BIND` |
 | Titan WS | Stub poll, rate-limited | Requires `ENABLE_TITAN_WS=true` + `TITAN_WS_URL` + `TITAN_WALLET_PUBKEY`, rate-limited |
 
 If Titan is enabled live without `TITAN_WALLET_PUBKEY`, feed-mux **refuses to connect** and logs: *wallet pubkey required for quote subscribe/compile*.

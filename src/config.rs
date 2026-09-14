@@ -31,6 +31,16 @@ pub struct Config {
     pub titan_hunt_size_lamports: Option<String>,
     /// TTL for hop-1 quote rows written to Redis (seconds)
     pub titan_hop1_ttl_secs: u64,
+    /// Triton UDP shreds for Bot 350 dry eyes (separate bind from KEEP :8002)
+    pub enable_triton_shred: bool,
+    /// UDP bind for duplicate Triton shred stream (default :8003 — never :8002)
+    pub shred_bind: String,
+    /// Watched vault pubkeys for Bot 350 (parsed from SHRED_WATCH_VAULTS)
+    pub shred_watch_vaults: Vec<[u8; 32]>,
+    /// TTL for mux:shred:hit wake rows (seconds)
+    pub shred_hit_ttl_secs: u64,
+    /// Optional leading bytes to strip from each UDP datagram (provider-specific)
+    pub shred_udp_prefix_skip: usize,
     /// Mock publish interval in dry-run mode (seconds, 0 = disabled)
     pub mock_publish_interval_secs: u64,
 }
@@ -59,6 +69,11 @@ impl Config {
             titan_local_bind: env_or("TITAN_LOCAL_BIND", "127.0.0.1:19001"),
             titan_hunt_size_lamports: env_optional("TITAN_HUNT_SIZE_LAMPORTS"),
             titan_hop1_ttl_secs: env_u64("TITAN_HOP1_TTL_SECS", 2),
+            enable_triton_shred: env_bool("ENABLE_TRITON_SHRED", false),
+            shred_bind: env_or("SHRED_BIND", "0.0.0.0:8003"),
+            shred_watch_vaults: parse_shred_watch_vaults_from_env(),
+            shred_hit_ttl_secs: env_u64("SHRED_HIT_TTL_SECS", 2),
+            shred_udp_prefix_skip: env_usize("SHRED_UDP_PREFIX_SKIP", 0),
             mock_publish_interval_secs: env_u64("MOCK_PUBLISH_INTERVAL_SECS", 30),
         }
     }
@@ -66,7 +81,7 @@ impl Config {
     /// Safe summary for logs — never includes secrets or full Redis URL.
     pub fn redacted_summary(&self) -> String {
         format!(
-            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} titan_ws={} titan_wallet={} titan_local={} triton_local={} triton_token={} triton_rps={} titan_rps={}",
+            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} triton_shred={} shred_bind={} shred_vaults={} titan_ws={} titan_wallet={} titan_local={} triton_local={} triton_token={} triton_rps={} titan_rps={}",
             self.bind_addr,
             self.dry_run,
             self.redis_url.as_ref().map(|_| "<set>").unwrap_or("<none>"),
@@ -74,6 +89,9 @@ impl Config {
             self.enable_chainstack,
             self.enable_helius,
             self.enable_triton_grpc,
+            self.enable_triton_shred,
+            self.shred_bind,
+            self.shred_watch_vaults.len(),
             self.enable_titan_ws,
             self.titan_wallet_pubkey
                 .as_ref()
@@ -89,6 +107,30 @@ impl Config {
             self.titan_rate_limit_rps,
         )
     }
+}
+
+fn parse_shred_watch_vaults_from_env() -> Vec<[u8; 32]> {
+    let Ok(raw) = env::var("SHRED_WATCH_VAULTS") else {
+        return Vec::new();
+    };
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match parse_wallet_pubkey(trimmed) {
+            Ok(pk) => out.push(pk),
+            Err(e) => {
+                tracing::warn!(error = %e, vault = %trimmed, "invalid SHRED_WATCH_VAULTS entry; skipping");
+            }
+        }
+    }
+    out
 }
 
 /// Parse and validate a Solana wallet public key (base58, 32 bytes).
@@ -134,6 +176,13 @@ fn env_u32(key: &str, default: u32) -> u32 {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
