@@ -34,6 +34,13 @@ rmp-serde = "1"
 rmpv = "1"
 bs58 = "0.5"
 url = "2"
+yellowstone-grpc-client = "13"
+yellowstone-grpc-proto = "12"
+tonic = "0.14"
+tonic-health = "0.14"
+prost = "0.14"
+tokio-stream = "0.1"
+async-trait = "0.1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

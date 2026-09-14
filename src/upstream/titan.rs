@@ -14,8 +14,8 @@ use crate::rate_limit::UpstreamRateLimiter;
 use crate::redis_fanout::RedisFanout;
 use crate::titan_local::TitanLocalRelay;
 use crate::titan_quote::{
-    handle_titan_server_message, parse_hunt_sizes, TitanMessageKind, TitanSizeBoard,
-    TitanStreamRegistry, USDC_MINT, SOL_MINT,
+    handle_titan_server_message, mint_pair_label, parse_hunt_sizes, publish_size_board_snapshot,
+    TitanMessageKind, TitanSizeBoard, TitanStreamRegistry, USDC_MINT, SOL_MINT,
 };
 use crate::upstream::UpstreamStatus;
 use crate::ws_reconnect::{
@@ -336,11 +336,12 @@ async fn run_session(
             .clear();
     }
     {
-        session_ctx
+        let mut board = session_ctx
             .size_board
             .lock()
-            .expect("size board lock")
-            .clear();
+            .expect("size board lock");
+        board.clear();
+        board.init_hunt_sizes(&session_ctx.hunt_sizes);
     }
 
     if !rate_limiter.try_acquire() {
@@ -358,6 +359,18 @@ async fn run_session(
         session_ctx,
     )
     .await?;
+
+    {
+        let (pair, base, mid) = mint_pair_label(SOL_MINT, USDC_MINT);
+        publish_size_board_snapshot(
+            fanout,
+            &session_ctx.size_board,
+            &pair,
+            &base,
+            &mid,
+        )
+        .await;
+    }
 
     let mut disconnect_kind = WsDisconnectKind::AbruptClose;
 
@@ -438,6 +451,11 @@ async fn subscribe_hunt_streams(
                 amount,
                 "rate limit exceeded for NewSwapQuoteStream"
             );
+            session_ctx
+                .size_board
+                .lock()
+                .expect("size board lock")
+                .mark_unsubscribed(*amount);
             continue;
         }
 

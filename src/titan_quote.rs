@@ -4,6 +4,9 @@
 //! - `mux:titan:size_board` — aggregate per-size hop-1 ages (KEEP-like pin board)
 //! - `mux:titan:hop1:<BASE>-<MID>:<size_lamports>` — individual hop-1 quote rows
 //! - `mux:titan:hop1_served` — counter incremented on each hop-1 row write
+//!
+//! Hop-1 row freshness: rows carry `ts_ms` only (no frozen `hop1_age_ms`). Bot 350
+//! consumers must derive age from `ts_ms` plus the hop-1 key TTL (`TITAN_HOP1_TTL_SECS`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -60,11 +63,23 @@ impl TitanStreamRegistry {
 #[derive(Default)]
 pub struct TitanSizeBoard {
     pins: HashMap<u64, SizeBoardPin>,
+    hunt_sizes: Vec<u64>,
+    unsubscribed: HashMap<u64, ()>,
 }
 
 impl TitanSizeBoard {
     pub fn clear(&mut self) {
         self.pins.clear();
+        self.hunt_sizes.clear();
+        self.unsubscribed.clear();
+    }
+
+    pub fn init_hunt_sizes(&mut self, sizes: &[u64]) {
+        self.hunt_sizes = sizes.to_vec();
+    }
+
+    pub fn mark_unsubscribed(&mut self, size_lamports: u64) {
+        self.unsubscribed.insert(size_lamports, ());
     }
 }
 
@@ -77,6 +92,9 @@ pub struct SizeBoardPin {
     pub venue_label: String,
     pub route_in_amount: u64,
     pub route_out_amount: u64,
+    /// `"unsubscribed"` when a hunt rung was skipped (e.g. rate limit); omitted when live.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,8 +114,8 @@ pub struct TitanHop1Row {
     pub base: String,
     pub mid: String,
     pub size_lamports: u64,
+    /// Publish timestamp — Bot 350 derives hop-1 age from this plus key TTL.
     pub ts_ms: u64,
-    pub hop1_age_ms: u64,
     pub provider: String,
     pub route_in_amount: u64,
     pub route_out_amount: u64,
@@ -379,7 +397,6 @@ async fn publish_hop1_quote(
     hop1_ttl_secs: u64,
 ) {
     let ts_ms = now_ms();
-    let hop1_age_ms = 0;
     let row = TitanHop1Row {
         schema: "mux.titan.hop1.v1",
         pair: quote.pair.clone(),
@@ -387,7 +404,6 @@ async fn publish_hop1_quote(
         mid: quote.mid.clone(),
         size_lamports: quote.size_lamports,
         ts_ms,
-        hop1_age_ms,
         provider: quote.provider.clone(),
         route_in_amount: quote.route_in_amount,
         route_out_amount: quote.route_out_amount,
@@ -400,16 +416,18 @@ async fn publish_hop1_quote(
 
     {
         let mut board = size_board.lock().expect("size board lock");
+        board.unsubscribed.remove(&quote.size_lamports);
         board.pins.insert(
             quote.size_lamports,
             SizeBoardPin {
                 size_lamports: quote.size_lamports,
-                hop1_age_ms,
+                hop1_age_ms: 0,
                 hop1_fresh_ms: ts_ms,
                 provider: quote.provider.clone(),
                 venue_label: quote.hop1.label.clone(),
                 route_in_amount: quote.route_in_amount,
                 route_out_amount: quote.route_out_amount,
+                status: None,
             },
         );
     }
@@ -429,21 +447,66 @@ fn build_size_board_doc(
     size_board: &Arc<Mutex<TitanSizeBoard>>,
     quote: &ParsedHop1Quote,
 ) -> TitanSizeBoardDoc {
+    build_size_board_doc_with_pair(
+        size_board,
+        &quote.pair,
+        &quote.base,
+        &quote.mid,
+    )
+}
+
+pub fn build_size_board_doc_with_pair(
+    size_board: &Arc<Mutex<TitanSizeBoard>>,
+    pair: &str,
+    base: &str,
+    mid: &str,
+) -> TitanSizeBoardDoc {
     let board = size_board.lock().expect("size board lock");
     let now = now_ms();
     let mut pins: Vec<SizeBoardPin> = board.pins.values().cloned().collect();
     for pin in &mut pins {
         pin.hop1_age_ms = now.saturating_sub(pin.hop1_fresh_ms);
     }
+    for &size_lamports in &board.hunt_sizes {
+        if board.pins.contains_key(&size_lamports) {
+            continue;
+        }
+        let status = if board.unsubscribed.contains_key(&size_lamports) {
+            Some("unsubscribed".to_string())
+        } else {
+            None
+        };
+        pins.push(SizeBoardPin {
+            size_lamports,
+            hop1_age_ms: 0,
+            hop1_fresh_ms: 0,
+            provider: String::new(),
+            venue_label: String::new(),
+            route_in_amount: 0,
+            route_out_amount: 0,
+            status,
+        });
+    }
     pins.sort_by_key(|p| p.size_lamports);
     TitanSizeBoardDoc {
         schema: "mux.titan.size_board.v1",
-        pair: quote.pair.clone(),
-        base: quote.base.clone(),
-        mid: quote.mid.clone(),
+        pair: pair.to_string(),
+        base: base.to_string(),
+        mid: mid.to_string(),
         updated_ms: now,
         pins,
     }
+}
+
+pub async fn publish_size_board_snapshot(
+    fanout: &RedisFanout,
+    size_board: &Arc<Mutex<TitanSizeBoard>>,
+    pair: &str,
+    base: &str,
+    mid: &str,
+) {
+    let doc = build_size_board_doc_with_pair(size_board, pair, base, mid);
+    fanout.publish_titan_size_board(&doc).await;
 }
 
 fn map_contains_key(value: &rmpv::Value, key: &str) -> bool {

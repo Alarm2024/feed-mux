@@ -203,7 +203,6 @@ fn hop1_row_json_shape_for_350_hunt() {
         mid: "USDC".to_string(),
         size_lamports: 2_500_000_000,
         ts_ms: 1_700_000_000_000,
-        hop1_age_ms: 0,
         provider: "fixture_provider".to_string(),
         route_in_amount: 2_500_000_000,
         route_out_amount: 375_000_000,
@@ -226,4 +225,110 @@ fn hop1_row_json_shape_for_350_hunt() {
     assert!(json.contains("\"size_lamports\":2500000000"));
     assert!(json.contains("\"pair\":\"SOL-USDC\""));
     assert!(json.contains("\"schema\":\"mux.titan.hop1.v1\""));
+    assert!(
+        !json.contains("hop1_age_ms"),
+        "hop-1 row must not freeze age; Bot 350 uses ts_ms + TTL"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unparseable_stream_data_does_not_write_hop1_key() {
+    let Some((url, mut conn)) = require_redis().await else {
+        return;
+    };
+
+    let suffix = now_ms();
+    let channel = format!("feed:350:test:bad:{suffix}");
+    let fanout = RedisFanout::connect(Some(url), channel, false).await;
+    fanout.reset_titan_state_at_boot().await;
+
+    let registry = Arc::new(Mutex::new(TitanStreamRegistry::default()));
+    let size_board = Arc::new(Mutex::new(TitanSizeBoard::default()));
+
+    #[derive(Serialize)]
+    struct BadStreamData {
+        #[serde(rename = "StreamData")]
+        stream_data: BadStreamBody,
+    }
+    #[derive(Serialize)]
+    struct BadStreamBody {
+        id: u32,
+        seq: u32,
+        payload: BadPayload,
+    }
+    #[derive(Serialize)]
+    struct BadPayload {
+        #[serde(rename = "NotSwapQuotes")]
+        junk: (),
+    }
+
+    // Valid msgpack but not a parseable SwapQuotes hop-1 frame.
+    let garbage = rmp_serde::to_vec_named(&BadStreamData {
+        stream_data: BadStreamBody {
+            id: 1,
+            seq: 0,
+            payload: BadPayload { junk: () },
+        },
+    })
+    .unwrap();
+
+    let kind = handle_titan_server_message(
+        &garbage,
+        &fanout,
+        &registry,
+        &size_board,
+        2,
+    )
+    .await;
+    assert_eq!(kind, feed_mux::titan_quote::TitanMessageKind::StreamDataNoHop1);
+
+    let hop1_served: i64 = conn.get(mux_keys::TITAN_HOP1_SERVED).await.unwrap();
+    assert_eq!(hop1_served, 0);
+
+    let row_key = mux_keys::hop1_row_key("SOL-USDC", 2_500_000_000);
+    let row: Option<String> = conn.get(&row_key).await.unwrap();
+    assert!(row.is_none(), "unparseable StreamData must not write hop1 key");
+}
+
+#[tokio::test]
+#[serial]
+async fn hop1_row_has_ttl() {
+    let Some((url, mut conn)) = require_redis().await else {
+        return;
+    };
+
+    let suffix = now_ms();
+    let channel = format!("feed:350:test:ttl:{suffix}");
+    let fanout = RedisFanout::connect(Some(url), channel, false).await;
+    fanout.reset_titan_state_at_boot().await;
+
+    let registry = Arc::new(Mutex::new(TitanStreamRegistry::default()));
+    {
+        let mut reg = registry.lock().unwrap();
+        reg.register_pending_request(2, 2_500_000_000);
+        reg.confirm_stream(2, 11);
+    }
+    let size_board = Arc::new(Mutex::new(TitanSizeBoard::default()));
+
+    let ttl_secs = 3_u64;
+    handle_titan_server_message(
+        &sample_stream_msg(),
+        &fanout,
+        &registry,
+        &size_board,
+        ttl_secs,
+    )
+    .await;
+
+    let row_key = mux_keys::hop1_row_key("SOL-USDC", 2_500_000_000);
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(&row_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ttl > 0 && ttl <= ttl_secs as i64,
+        "hop1 key must have set_ex TTL, got {ttl}"
+    );
 }

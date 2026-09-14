@@ -5,6 +5,7 @@ pub mod rate_limit;
 pub mod redis_fanout;
 pub mod titan_local;
 pub mod titan_quote;
+pub mod triton_local;
 pub mod upstream;
 pub mod ws_reconnect;
 
@@ -16,6 +17,7 @@ use http::{router, AppState};
 use mock::spawn_mock_publisher;
 use redis_fanout::RedisFanout;
 use titan_local::TitanLocalRelay;
+use triton_local::TritonLocalRelay;
 use upstream::UpstreamHub;
 
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -36,12 +38,22 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error + Send 
         config.enable_titan_ws,
     );
 
+    let triton_local_relay = TritonLocalRelay::new();
+    triton_local_relay.clone().spawn_server(
+        config.triton_local_bind.clone(),
+        config.enable_triton_grpc,
+    );
+
     if config.dry_run {
         tracing::info!("DRY_RUN=true — upstream stubs and redis publish are mocked by default");
         spawn_mock_publisher(config.clone(), fanout.clone()).await;
     } else {
         fanout.reset_titan_state_at_boot().await;
-        upstreams.spawn_live(fanout.clone(), Some(titan_local_relay));
+        upstreams.spawn_live(
+            fanout.clone(),
+            Some(titan_local_relay),
+            Some(triton_local_relay),
+        );
 
         let heartbeat_fanout = fanout.clone();
         tokio::spawn(async move {
