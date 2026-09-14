@@ -4,6 +4,7 @@ pub mod titan;
 pub mod triton;
 
 use crate::config::Config;
+use crate::triton_local::TritonLocalProbe;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,7 +63,9 @@ impl UpstreamHub {
         &self,
         fanout: crate::redis_fanout::RedisFanout,
         titan_local_relay: Option<crate::titan_local::TitanLocalRelay>,
+        triton_local_probe: TritonLocalProbe,
     ) {
+        self.triton.spawn_live(fanout.clone(), triton_local_probe);
         self.titan.spawn_live(fanout, titan_local_relay);
     }
 }

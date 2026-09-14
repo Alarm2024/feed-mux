@@ -37,7 +37,9 @@ async fn redacted_summary_never_contains_redis_password() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
+        triton_grpc_token: None,
         triton_rate_limit_rps: 25,
+        triton_local_bind: "127.0.0.1:19000".to_string(),
         enable_titan_ws: false,
         titan_ws_url: None,
         titan_wallet_pubkey: None,
@@ -122,7 +124,9 @@ fn titan_live_requires_wallet_pubkey() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
+        triton_grpc_token: None,
         triton_rate_limit_rps: 25,
+        triton_local_bind: "127.0.0.1:19000".to_string(),
         enable_titan_ws: true,
         titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
         titan_wallet_pubkey: None,
@@ -135,6 +139,37 @@ fn titan_live_requires_wallet_pubkey() {
     let status = upstream.status();
     assert_eq!(status.mode, "error/wallet-pubkey-required");
     assert!(!status.connected);
+}
+
+#[test]
+fn triton_live_reports_connecting_until_stream_up() {
+    let config = Config {
+        bind_addr: "127.0.0.1:8787".to_string(),
+        dry_run: false,
+        redis_url: None,
+        redis_channel: "feed:350".to_string(),
+        enable_chainstack: false,
+        chainstack_rpc_url: None,
+        chainstack_ws_url: None,
+        enable_helius: false,
+        helius_rpc_url: None,
+        enable_triton_grpc: true,
+        triton_grpc_url: Some("https://example.test:443".to_string()),
+        triton_grpc_token: Some("secret-token".to_string()),
+        triton_rate_limit_rps: 25,
+        triton_local_bind: "127.0.0.1:19000".to_string(),
+        enable_titan_ws: false,
+        titan_ws_url: None,
+        titan_wallet_pubkey: None,
+        titan_rate_limit_rps: 15,
+        titan_local_bind: "127.0.0.1:19001".to_string(),
+        mock_publish_interval_secs: 0,
+    };
+
+    let upstream = feed_mux::upstream::triton::TritonGrpcUpstream::new(&config);
+    let status = upstream.status();
+    assert_eq!(status.mode, "live/connecting");
+    assert!(!status.connected, "must not claim connected before gRPC stream is up");
 }
 
 #[test]
@@ -151,7 +186,9 @@ fn titan_dry_run_stays_stub_without_wallet_pubkey() {
         helius_rpc_url: None,
         enable_triton_grpc: false,
         triton_grpc_url: None,
+        triton_grpc_token: None,
         triton_rate_limit_rps: 25,
+        triton_local_bind: "127.0.0.1:19000".to_string(),
         enable_titan_ws: true,
         titan_ws_url: Some("wss://example.test/api/v1/ws".to_string()),
         titan_wallet_pubkey: None,

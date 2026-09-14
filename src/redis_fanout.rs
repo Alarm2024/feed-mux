@@ -18,8 +18,11 @@ pub mod mux_keys {
     pub const TITAN_PAIRS_LIVE: &str = "mux:titan:pairs_live";
     pub const TITAN_LAST_FRAME_MS: &str = "mux:titan:last_frame_ms";
     pub const TITAN_FRESHEST_MS: &str = "mux:titan:freshest_ms";
+    pub const TRITON_FRAMES: &str = "mux:triton:frames";
+    pub const TRITON_LAST_FRAME_MS: &str = "mux:triton:last_frame_ms";
     pub const META_HEARTBEAT_MS: &str = "mux:meta:heartbeat_ms";
     pub const META_TITAN_UP: &str = "mux:meta:titan_up";
+    pub const META_TRITON_UP: &str = "mux:meta:triton_up";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,7 +140,7 @@ impl RedisFanout {
             return;
         };
         let zero = "0";
-        let results: Result<((), (), (), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
+        let results: Result<((), (), (), (), (), (), (), (), (), (), ()), redis::RedisError> = redis::pipe()
             .set(mux_keys::TITAN_FRAMES, zero)
             .set(mux_keys::TITAN_DECODED, zero)
             .set(mux_keys::TITAN_ERRORS, zero)
@@ -146,7 +149,10 @@ impl RedisFanout {
             .set(mux_keys::TITAN_PAIRS_LIVE, zero)
             .set(mux_keys::TITAN_LAST_FRAME_MS, zero)
             .set(mux_keys::TITAN_FRESHEST_MS, zero)
+            .set(mux_keys::TRITON_FRAMES, zero)
+            .set(mux_keys::TRITON_LAST_FRAME_MS, zero)
             .set(mux_keys::META_TITAN_UP, zero)
+            .set(mux_keys::META_TRITON_UP, zero)
             .query_async(conn)
             .await;
         if let Err(e) = results {
@@ -199,6 +205,43 @@ impl RedisFanout {
                 tracing::warn!(error = %e, "failed to clear mux pairs_live on disconnect");
             }
         }
+    }
+
+    /// Reflect Triton Yellowstone gRPC stream connectivity (`mux:meta:triton_up`).
+    pub async fn set_triton_upstream_up(&self, up: bool) {
+        if self.dry_run {
+            return;
+        }
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let flag = if up { "1" } else { "0" };
+        if let Err(e) = conn
+            .set::<_, _, ()>(mux_keys::META_TRITON_UP, flag)
+            .await
+        {
+            tracing::warn!(error = %e, up, "failed to write mux triton_up");
+        }
+    }
+
+    /// Record a Triton gRPC subscribe update (slot/block/ping/etc).
+    pub async fn record_triton_frame(&self) {
+        if self.dry_run {
+            return;
+        }
+        let ts = now_ms();
+        let mut guard = self.conn.lock().await;
+        let Some(conn) = guard.as_mut() else {
+            return;
+        };
+        let ts_str = ts.to_string();
+        let _: Result<((), (), ()), redis::RedisError> = redis::pipe()
+            .incr(mux_keys::TRITON_FRAMES, 1_i64)
+            .set(mux_keys::TRITON_LAST_FRAME_MS, &ts_str)
+            .set(mux_keys::META_TRITON_UP, "1")
+            .query_async(conn)
+            .await;
     }
 
     /// Record decode failure on a Titan WS binary frame.
@@ -292,10 +335,12 @@ mod tests {
             mux_keys::TITAN_PAIRS_LIVE,
             mux_keys::TITAN_LAST_FRAME_MS,
             mux_keys::TITAN_FRESHEST_MS,
+            mux_keys::TRITON_FRAMES,
             mux_keys::META_HEARTBEAT_MS,
             mux_keys::META_TITAN_UP,
+            mux_keys::META_TRITON_UP,
         ];
-        assert_eq!(keys.len(), 10);
+        assert_eq!(keys.len(), 12);
         for key in keys {
             assert!(key.starts_with("mux:"));
         }
@@ -313,6 +358,9 @@ mod tests {
         fanout.heartbeat().await;
         fanout.set_titan_upstream_up(true).await;
         fanout.set_titan_upstream_up(false).await;
+        fanout.set_triton_upstream_up(true).await;
+        fanout.set_triton_upstream_up(false).await;
+        fanout.record_triton_frame().await;
         fanout.record_titan_decode_error().await;
         fanout
             .record_titan_message(TitanMessageOutcome::QuotePublished)

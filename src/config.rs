@@ -13,10 +13,12 @@ pub struct Config {
     /// Helius backup upstream
     pub enable_helius: bool,
     pub helius_rpc_url: Option<String>,
-    /// Triton gRPC upstream — rate-limited separately
+    /// Triton Yellowstone gRPC upstream — rate-limited separately
     pub enable_triton_grpc: bool,
     pub triton_grpc_url: Option<String>,
+    pub triton_grpc_token: Option<String>,
     pub triton_rate_limit_rps: u32,
+    pub triton_local_bind: String,
     /// Titan WS upstream — rate-limited separately; requires wallet pubkey when live
     pub enable_titan_ws: bool,
     pub titan_ws_url: Option<String>,
@@ -42,7 +44,9 @@ impl Config {
             helius_rpc_url: env_optional("HELIUS_RPC_URL"),
             enable_triton_grpc: env_bool("ENABLE_TRITON_GRPC", false),
             triton_grpc_url: env_optional("TRITON_GRPC_URL"),
+            triton_grpc_token: env_optional("TRITON_GRPC_TOKEN").or_else(|| env_optional("X_TOKEN")),
             triton_rate_limit_rps: env_u32("TRITON_RATE_LIMIT_RPS", 25),
+            triton_local_bind: env_or("TRITON_LOCAL_BIND", "127.0.0.1:19000"),
             enable_titan_ws: env_bool("ENABLE_TITAN_WS", false),
             titan_ws_url: env_optional("TITAN_WS_URL"),
             titan_wallet_pubkey: env_optional("TITAN_WALLET_PUBKEY"),
@@ -55,7 +59,7 @@ impl Config {
     /// Safe summary for logs — never includes secrets or full Redis URL.
     pub fn redacted_summary(&self) -> String {
         format!(
-            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} titan_ws={} titan_wallet={} titan_local={} triton_rps={} titan_rps={}",
+            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} triton_token={} triton_local={} titan_ws={} titan_wallet={} titan_local={} triton_rps={} titan_rps={}",
             self.bind_addr,
             self.dry_run,
             self.redis_url.as_ref().map(|_| "<set>").unwrap_or("<none>"),
@@ -63,6 +67,11 @@ impl Config {
             self.enable_chainstack,
             self.enable_helius,
             self.enable_triton_grpc,
+            self.triton_grpc_token
+                .as_ref()
+                .map(|_| "<set>")
+                .unwrap_or("<none>"),
+            self.triton_local_bind,
             self.enable_titan_ws,
             self.titan_wallet_pubkey
                 .as_ref()
