@@ -16,7 +16,10 @@ pub struct Config {
     /// Triton gRPC upstream — rate-limited separately
     pub enable_triton_grpc: bool,
     pub triton_grpc_url: Option<String>,
+    pub triton_grpc_token: Option<String>,
     pub triton_rate_limit_rps: u32,
+    /// Local Triton gRPC relay for Bot 350 (no second Yellowstone subscribe)
+    pub triton_local_bind: String,
     /// Titan WS upstream — rate-limited separately; requires wallet pubkey when live
     pub enable_titan_ws: bool,
     pub titan_ws_url: Option<String>,
@@ -24,6 +27,10 @@ pub struct Config {
     pub titan_rate_limit_rps: u32,
     /// Local Titan WS relay for Bot 350 MUX_TITAN_BIND eyes probe
     pub titan_local_bind: String,
+    /// Comma-separated SOL hunt sizes in lamports (default ladder when unset)
+    pub titan_hunt_size_lamports: Option<String>,
+    /// TTL for hop-1 quote rows written to Redis (seconds)
+    pub titan_hop1_ttl_secs: u64,
     /// Mock publish interval in dry-run mode (seconds, 0 = disabled)
     pub mock_publish_interval_secs: u64,
 }
@@ -42,12 +49,16 @@ impl Config {
             helius_rpc_url: env_optional("HELIUS_RPC_URL"),
             enable_triton_grpc: env_bool("ENABLE_TRITON_GRPC", false),
             triton_grpc_url: env_optional("TRITON_GRPC_URL"),
+            triton_grpc_token: env_optional("TRITON_GRPC_TOKEN"),
             triton_rate_limit_rps: env_u32("TRITON_RATE_LIMIT_RPS", 25),
+            triton_local_bind: env_or("TRITON_LOCAL_BIND", "127.0.0.1:19000"),
             enable_titan_ws: env_bool("ENABLE_TITAN_WS", false),
             titan_ws_url: env_optional("TITAN_WS_URL"),
             titan_wallet_pubkey: env_optional("TITAN_WALLET_PUBKEY"),
             titan_rate_limit_rps: env_u32("TITAN_RATE_LIMIT_RPS", 15),
             titan_local_bind: env_or("TITAN_LOCAL_BIND", "127.0.0.1:19001"),
+            titan_hunt_size_lamports: env_optional("TITAN_HUNT_SIZE_LAMPORTS"),
+            titan_hop1_ttl_secs: env_u64("TITAN_HOP1_TTL_SECS", 2),
             mock_publish_interval_secs: env_u64("MOCK_PUBLISH_INTERVAL_SECS", 30),
         }
     }
@@ -55,7 +66,7 @@ impl Config {
     /// Safe summary for logs — never includes secrets or full Redis URL.
     pub fn redacted_summary(&self) -> String {
         format!(
-            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} titan_ws={} titan_wallet={} titan_local={} triton_rps={} titan_rps={}",
+            "bind={} dry_run={} redis={} channel={} chainstack={} helius={} triton_grpc={} titan_ws={} titan_wallet={} titan_local={} triton_local={} triton_token={} triton_rps={} titan_rps={}",
             self.bind_addr,
             self.dry_run,
             self.redis_url.as_ref().map(|_| "<set>").unwrap_or("<none>"),
@@ -69,6 +80,11 @@ impl Config {
                 .map(|_| "<set>")
                 .unwrap_or("<none>"),
             self.titan_local_bind,
+            self.triton_local_bind,
+            self.triton_grpc_token
+                .as_ref()
+                .map(|_| "<set>")
+                .unwrap_or("<none>"),
             self.triton_rate_limit_rps,
             self.titan_rate_limit_rps,
         )

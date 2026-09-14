@@ -56,6 +56,7 @@ async fn boot_reset_zeroes_stale_counters_before_heartbeat() {
     let _: () = conn.set(mux_keys::TITAN_LAST_FRAME_MS, stale_ts).await.unwrap();
     let _: () = conn.set(mux_keys::TITAN_FRESHEST_MS, stale_ts).await.unwrap();
     let _: () = conn.set(mux_keys::META_TITAN_UP, "1").await.unwrap();
+    let _: () = conn.set(mux_keys::META_TRITON_UP, "1").await.unwrap();
     let _: () = conn.set(mux_keys::TITAN_PAIRS_LIVE, "1").await.unwrap();
 
     fanout.reset_titan_state_at_boot().await;
@@ -63,11 +64,17 @@ async fn boot_reset_zeroes_stale_counters_before_heartbeat() {
     let frames: String = conn.get(mux_keys::TITAN_FRAMES).await.unwrap();
     let last_frame_ms: String = conn.get(mux_keys::TITAN_LAST_FRAME_MS).await.unwrap();
     let titan_up: String = conn.get(mux_keys::META_TITAN_UP).await.unwrap();
+    let triton_up: String = conn.get(mux_keys::META_TRITON_UP).await.unwrap();
     let pairs_live: String = conn.get(mux_keys::TITAN_PAIRS_LIVE).await.unwrap();
+    let hop1_served: String = conn.get(mux_keys::TITAN_HOP1_SERVED).await.unwrap();
+    let size_board: String = conn.get(mux_keys::TITAN_SIZE_BOARD).await.unwrap();
     assert_eq!(frames, "0");
     assert_eq!(last_frame_ms, "0");
     assert_eq!(titan_up, "0");
+    assert_eq!(triton_up, "0");
     assert_eq!(pairs_live, "0");
+    assert_eq!(hop1_served, "0");
+    assert!(size_board.contains("mux.titan.size_board.v1"));
 
     fanout.heartbeat().await;
     let heartbeat: String = conn.get(mux_keys::META_HEARTBEAT_MS).await.unwrap();
@@ -148,4 +155,64 @@ async fn live_mux_metrics_disconnect_clears_titan_up_and_pairs_live() {
     let pairs_live: String = conn.get(mux_keys::TITAN_PAIRS_LIVE).await.unwrap();
     assert_eq!(titan_up, "0");
     assert_eq!(pairs_live, "0");
+}
+
+#[tokio::test]
+#[serial]
+async fn triton_up_and_frames_track_upstream_liveness() {
+    let Some((url, mut conn)) = require_redis().await else {
+        return;
+    };
+
+    let suffix = now_ms();
+    let channel = format!("feed:350:test:triton:{suffix}");
+    let fanout = RedisFanout::connect(Some(url), channel, false).await;
+
+    fanout.reset_titan_state_at_boot().await;
+    fanout.set_triton_upstream_up(true).await;
+    fanout.record_triton_frame().await;
+
+    let triton_up: String = conn.get(mux_keys::META_TRITON_UP).await.unwrap();
+    let frames: i64 = conn.get(mux_keys::TRITON_FRAMES).await.unwrap();
+    let last_ms: String = conn.get(mux_keys::TRITON_LAST_FRAME_MS).await.unwrap();
+    assert_eq!(triton_up, "1");
+    assert_eq!(frames, 1);
+    assert!(last_ms.parse::<u64>().unwrap() > 0);
+
+    fanout.set_triton_upstream_up(false).await;
+    let triton_up_after: String = conn.get(mux_keys::META_TRITON_UP).await.unwrap();
+    assert_eq!(triton_up_after, "0");
+}
+
+#[test]
+fn triton_status_not_connected_before_stream_up() {
+    let config = feed_mux::config::Config {
+        bind_addr: "127.0.0.1:8787".to_string(),
+        dry_run: false,
+        redis_url: None,
+        redis_channel: "feed:350".to_string(),
+        enable_chainstack: false,
+        chainstack_rpc_url: None,
+        chainstack_ws_url: None,
+        enable_helius: false,
+        helius_rpc_url: None,
+        enable_triton_grpc: true,
+        triton_grpc_url: Some("https://example.test/grpc".to_string()),
+        triton_grpc_token: None,
+        triton_rate_limit_rps: 25,
+        triton_local_bind: "127.0.0.1:19000".to_string(),
+        enable_titan_ws: false,
+        titan_ws_url: None,
+        titan_wallet_pubkey: None,
+        titan_rate_limit_rps: 15,
+        titan_local_bind: "127.0.0.1:19001".to_string(),
+        titan_hunt_size_lamports: None,
+        titan_hop1_ttl_secs: 2,
+        mock_publish_interval_secs: 0,
+    };
+
+    let upstream = feed_mux::upstream::triton::TritonGrpcUpstream::new(&config);
+    let status = upstream.status();
+    assert_eq!(status.mode, "live/connecting");
+    assert!(!status.connected, "connected must be false until stream is up");
 }

@@ -62,7 +62,10 @@ impl UpstreamHub {
         &self,
         fanout: crate::redis_fanout::RedisFanout,
         titan_local_relay: Option<crate::titan_local::TitanLocalRelay>,
+        triton_local_relay: Option<crate::triton_local::TritonLocalRelay>,
     ) {
+        self.triton
+            .spawn_live(fanout.clone(), triton_local_relay);
         self.titan.spawn_live(fanout, titan_local_relay);
     }
 }
